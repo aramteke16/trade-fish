@@ -39,12 +39,8 @@ def create_llm_client(
         return OpenAIClient(model, base_url, provider=provider_lower, **kwargs)
 
     if provider_lower == "anthropic":
-        # Check if claude_mode is set to "cli" in kwargs
-        claude_mode = kwargs.pop("claude_mode", None)
-        if claude_mode == "cli":
-            from .claude_connector import ClaudeConnector
-            project_root = kwargs.pop("project_root", None)
-            return ClaudeConnector(model, base_url, mode="cli", project_root=project_root, **kwargs)
+        kwargs.pop("claude_mode", None)
+        kwargs.pop("project_root", None)
         from .anthropic_client import AnthropicClient
         return AnthropicClient(model, base_url, **kwargs)
 
