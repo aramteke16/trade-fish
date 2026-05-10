@@ -161,11 +161,12 @@ def transition_to(
             "WHERE id = 1",
             (new_state, now_ist, trade_date, next_run_iso, last_error, payload_json),
         )
-        conn.execute(
-            "INSERT INTO pipeline_state_history (from_state, to_state, note) "
-            "VALUES (?, ?, ?)",
-            (from_state, new_state, note),
-        )
+        if from_state != new_state:
+            conn.execute(
+                "INSERT INTO pipeline_state_history (from_state, to_state, note) "
+                "VALUES (?, ?, ?)",
+                (from_state, new_state, note),
+            )
         conn.commit()
     except Exception:
         conn.rollback()
@@ -179,6 +180,18 @@ def transition_to(
             from_state, new_state, f" ({note})" if note else "",
         )
     return read_state()
+
+
+def touch_state_since() -> None:
+    """Update only state_since without writing to history. Used by the
+    dispatcher on no-op ticks to keep the UI badge time fresh."""
+    conn = get_conn()
+    conn.execute(
+        "UPDATE pipeline_state SET state_since = ? WHERE id = 1",
+        (datetime.now(IST).isoformat(),),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_history(limit: int = 50) -> list[dict]:

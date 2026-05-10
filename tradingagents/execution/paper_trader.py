@@ -129,7 +129,10 @@ class PaperTrader:
                     )
                     capital_used = order.filled_price * order.quantity
                     self.position_tracker.add_position(pos, capital_used)
-                    events.append({"type": "entry", "ticker": ticker, "price": price, "qty": order.quantity})
+                    events.append({
+                        "type": "entry", "ticker": ticker, "price": price, "qty": order.quantity,
+                        "stop_loss": order.stop_loss, "target_1": order.target_1, "target_2": order.target_2,
+                    })
 
         # Check open positions for this ticker
         if ticker in self.position_tracker.open_positions:
@@ -138,7 +141,7 @@ class PaperTrader:
 
             if exit_signal == "sl":
                 closed = self.position_tracker.close_position(ticker, price, "stop_loss", current_time)
-                events.append({"type": "exit", "ticker": ticker, "price": price, "reason": "stop_loss", "pnl": closed.pnl if closed else None})
+                events.append({"type": "exit", "ticker": ticker, "price": price, "reason": "stop_loss", "pnl": closed.pnl if closed else None, "pnl_pct": closed.pnl_pct if closed else None})
 
             elif exit_signal == "target1" and not pos.partial_exit_1_done:
                 # Partial exit 50% (or full exit if qty < 2). When < 2 there is
@@ -168,7 +171,7 @@ class PaperTrader:
 
             elif exit_signal == "target2":
                 closed = self.position_tracker.close_position(ticker, price, "target_2", current_time)
-                events.append({"type": "exit", "ticker": ticker, "price": price, "reason": "target_2", "pnl": closed.pnl if closed else None})
+                events.append({"type": "exit", "ticker": ticker, "price": price, "reason": "target_2", "pnl": closed.pnl if closed else None, "pnl_pct": closed.pnl_pct if closed else None})
 
         return events
 
@@ -176,7 +179,7 @@ class PaperTrader:
         events = []
         if ticker in self.position_tracker.open_positions:
             closed = self.position_tracker.close_position(ticker, price, "hard_exit", current_time)
-            events.append({"type": "exit", "ticker": ticker, "price": price, "reason": "hard_exit", "pnl": closed.pnl if closed else None})
+            events.append({"type": "exit", "ticker": ticker, "price": price, "reason": "hard_exit", "pnl": closed.pnl if closed else None, "pnl_pct": closed.pnl_pct if closed else None})
         return events
 
     def force_exit_position(self, ticker: str, price: float, reason: str, current_time: datetime) -> List[dict]:
@@ -186,13 +189,13 @@ class PaperTrader:
         closed = self.position_tracker.close_position(ticker, price, reason, current_time)
         if closed is None:
             return []
-        return [{"type": "exit", "ticker": closed.ticker, "price": closed.exit_price, "reason": reason, "pnl": closed.pnl}]
+        return [{"type": "exit", "ticker": closed.ticker, "price": closed.exit_price, "reason": reason, "pnl": closed.pnl, "pnl_pct": closed.pnl_pct}]
 
     def hard_exit_all(self, prices: Dict[str, float], current_time: datetime) -> List[dict]:
         """Close all open positions (e.g. at 3:15 PM)."""
         closed = self.position_tracker.close_all_positions(prices, current_time, "hard_exit")
         return [
-            {"type": "exit", "ticker": c.ticker, "price": c.exit_price, "reason": "hard_exit", "pnl": c.pnl}
+            {"type": "exit", "ticker": c.ticker, "price": c.exit_price, "reason": "hard_exit", "pnl": c.pnl, "pnl_pct": c.pnl_pct}
             for c in closed
         ]
 

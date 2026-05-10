@@ -23,7 +23,7 @@ from tradingagents.execution.risk_manager import (
 )
 from tradingagents.pipeline.news_monitor import NewsAction, NewsMonitor
 from tradingagents.dataflows.indian_market import is_execution_window, IST
-from tradingagents.web.database import insert_position
+from tradingagents.web.database import insert_position, update_position_exit
 
 logger = logging.getLogger(__name__)
 
@@ -315,19 +315,19 @@ class MarketMonitor:
                 "ticker": ticker,
                 "entry_price": price,
                 "quantity": event.get("qty"),
+                "stop_loss": event.get("stop_loss"),
+                "target_1": event.get("target_1"),
+                "target_2": event.get("target_2"),
                 "status": "open",
                 "opened_at": now.isoformat(),
             })
         elif event_type in ("exit", "partial_exit"):
             pnl_str = f" P&L=Rs.{pnl:.2f}" if pnl is not None else ""
             logger.info("EXIT: %s @ %.2f reason=%s%s", ticker, price, reason, pnl_str)
-            insert_position({
-                "date": now.strftime("%Y-%m-%d"),
-                "ticker": ticker,
+            update_position_exit(ticker, now.strftime("%Y-%m-%d"), {
                 "exit_price": price,
                 "exit_reason": reason,
                 "pnl": pnl,
                 "pnl_pct": event.get("pnl_pct"),
-                "status": "closed",
                 "closed_at": now.isoformat(),
             })

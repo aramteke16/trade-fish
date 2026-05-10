@@ -154,14 +154,24 @@ def get_config_grouped(category: Optional[str] = None) -> dict:
         display_value = value
         if is_secret:
             display_value = "***" if value else None
-        items.append({
+        item = {
             "key": row["key"],
             "value": display_value,
             "is_secret": is_secret,
             "category": row["category"],
             "description": row["description"],
             "updated_at": row["updated_at"],
-        })
+        }
+        meta = CONFIG_METADATA.get(row["key"], {})
+        if meta.get("hidden"):
+            continue
+        if "options" in meta:
+            item["options"] = meta["options"]
+        if "provider_models" in meta:
+            item["provider_models"] = meta["provider_models"]
+        if "input_type" in meta:
+            item["input_type"] = meta["input_type"]
+        items.append(item)
 
     if category:
         return {category: items}

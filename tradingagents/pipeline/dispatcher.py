@@ -86,6 +86,19 @@ def _clear_runtime() -> None:
         _daily_runtime.clear()
 
 
+def get_active_paper_trader():
+    """Return the current day's PaperTrader if one exists, else None.
+
+    Used by the REST endpoint for manual position exits.
+    """
+    with _runtime_lock:
+        for runtime in _daily_runtime.values():
+            pt = runtime.get("paper_trader")
+            if pt is not None:
+                return pt
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher entry point
 # ---------------------------------------------------------------------------
@@ -120,6 +133,8 @@ def dispatch_pipeline() -> None:
 
     if next_state is not None and next_state != state_row.state:
         sm.transition_to(next_state, trade_date=state_row.trade_date)
+    else:
+        sm.touch_state_since()
 
 
 # ---------------------------------------------------------------------------

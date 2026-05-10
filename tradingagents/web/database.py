@@ -253,152 +253,192 @@ def _seed_default_config_if_empty(conn: sqlite3.Connection) -> None:
 
 def insert_trade_plan(plan: dict):
     conn = get_conn()
-    conn.execute("""
-        INSERT INTO trade_plans
-        (date, ticker, rating, entry_zone_low, entry_zone_high, stop_loss,
-         target_1, target_2, confidence_score, position_size_pct, skip_rule, thesis)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        plan.get("date", datetime.now().strftime("%Y-%m-%d")),
-        plan.get("ticker"),
-        plan.get("rating"),
-        plan.get("entry_zone_low"),
-        plan.get("entry_zone_high"),
-        plan.get("stop_loss"),
-        plan.get("target_1"),
-        plan.get("target_2"),
-        plan.get("confidence_score"),
-        plan.get("position_size_pct"),
-        plan.get("skip_rule"),
-        plan.get("thesis"),
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("""
+            INSERT INTO trade_plans
+            (date, ticker, rating, entry_zone_low, entry_zone_high, stop_loss,
+             target_1, target_2, confidence_score, position_size_pct, skip_rule, thesis)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            plan.get("date", datetime.now().strftime("%Y-%m-%d")),
+            plan.get("ticker"),
+            plan.get("rating"),
+            plan.get("entry_zone_low"),
+            plan.get("entry_zone_high"),
+            plan.get("stop_loss"),
+            plan.get("target_1"),
+            plan.get("target_2"),
+            plan.get("confidence_score"),
+            plan.get("position_size_pct"),
+            plan.get("skip_rule"),
+            plan.get("thesis"),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def insert_debate(debate: dict):
     conn = get_conn()
-    conn.execute("""
-        INSERT INTO debates
-        (date, ticker, round_num, bull_argument, bear_argument, verdict, confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        debate.get("date", datetime.now().strftime("%Y-%m-%d")),
-        debate.get("ticker"),
-        debate.get("round_num", 1),
-        debate.get("bull_argument"),
-        debate.get("bear_argument"),
-        debate.get("verdict"),
-        debate.get("confidence"),
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("""
+            INSERT INTO debates
+            (date, ticker, round_num, bull_argument, bear_argument, verdict, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            debate.get("date", datetime.now().strftime("%Y-%m-%d")),
+            debate.get("ticker"),
+            debate.get("round_num", 1),
+            debate.get("bull_argument"),
+            debate.get("bear_argument"),
+            debate.get("verdict"),
+            debate.get("confidence"),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def insert_position(position: dict):
     conn = get_conn()
-    conn.execute("""
-        INSERT INTO positions
-        (date, ticker, quantity, entry_price, exit_price, stop_loss,
-         target_1, target_2, status, exit_reason, pnl, pnl_pct, opened_at, closed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        position.get("date", datetime.now().strftime("%Y-%m-%d")),
-        position.get("ticker"),
-        position.get("quantity"),
-        position.get("entry_price"),
-        position.get("exit_price"),
-        position.get("stop_loss"),
-        position.get("target_1"),
-        position.get("target_2"),
-        position.get("status"),
-        position.get("exit_reason"),
-        position.get("pnl"),
-        position.get("pnl_pct"),
-        position.get("opened_at"),
-        position.get("closed_at"),
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("""
+            INSERT INTO positions
+            (date, ticker, quantity, entry_price, exit_price, stop_loss,
+             target_1, target_2, status, exit_reason, pnl, pnl_pct, opened_at, closed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            position.get("date", datetime.now().strftime("%Y-%m-%d")),
+            position.get("ticker"),
+            position.get("quantity"),
+            position.get("entry_price"),
+            position.get("exit_price"),
+            position.get("stop_loss"),
+            position.get("target_1"),
+            position.get("target_2"),
+            position.get("status"),
+            position.get("exit_reason"),
+            position.get("pnl"),
+            position.get("pnl_pct"),
+            position.get("opened_at"),
+            position.get("closed_at"),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_position_exit(ticker: str, date: str, exit_data: dict):
+    """Update an open position row with exit data instead of inserting a new row."""
+    conn = get_conn()
+    try:
+        conn.execute("""
+            UPDATE positions SET
+                exit_price = ?, exit_reason = ?, pnl = ?, pnl_pct = ?,
+                status = 'closed', closed_at = ?
+            WHERE ticker = ? AND date = ? AND status = 'open'
+        """, (
+            exit_data.get("exit_price"),
+            exit_data.get("exit_reason"),
+            exit_data.get("pnl"),
+            exit_data.get("pnl_pct"),
+            exit_data.get("closed_at"),
+            ticker, date,
+        ))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def insert_daily_metrics(metrics: dict):
     conn = get_conn()
-    conn.execute("""
-        INSERT OR REPLACE INTO daily_metrics
-        (date, capital, daily_pnl, daily_return_pct, total_trades, win_rate, max_drawdown_pct, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        metrics.get("date", datetime.now().strftime("%Y-%m-%d")),
-        metrics.get("capital"),
-        metrics.get("daily_pnl"),
-        metrics.get("daily_return_pct"),
-        metrics.get("total_trades"),
-        metrics.get("win_rate"),
-        metrics.get("max_drawdown_pct"),
-        metrics.get("notes"),
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("""
+            INSERT OR REPLACE INTO daily_metrics
+            (date, capital, daily_pnl, daily_return_pct, total_trades, win_rate, max_drawdown_pct, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            metrics.get("date", datetime.now().strftime("%Y-%m-%d")),
+            metrics.get("capital"),
+            metrics.get("daily_pnl"),
+            metrics.get("daily_return_pct"),
+            metrics.get("total_trades"),
+            metrics.get("win_rate"),
+            metrics.get("max_drawdown_pct"),
+            metrics.get("notes"),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def insert_agent_report(report: dict):
     conn = get_conn()
-    conn.execute("""
-        INSERT INTO agent_reports
-        (date, ticker, agent_type, report)
-        VALUES (?, ?, ?, ?)
-    """, (
-        report.get("date", datetime.now().strftime("%Y-%m-%d")),
-        report.get("ticker"),
-        report.get("agent_type"),
-        report.get("report"),
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        conn.execute("""
+            INSERT INTO agent_reports
+            (date, ticker, agent_type, report)
+            VALUES (?, ?, ?, ?)
+        """, (
+            report.get("date", datetime.now().strftime("%Y-%m-%d")),
+            report.get("ticker"),
+            report.get("agent_type"),
+            report.get("report"),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_trade_plans(date: Optional[str] = None) -> List[dict]:
     conn = get_conn()
-    if date:
-        rows = conn.execute("SELECT * FROM trade_plans WHERE date = ? ORDER BY created_at DESC", (date,)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM trade_plans ORDER BY created_at DESC LIMIT 50").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        if date:
+            rows = conn.execute("SELECT * FROM trade_plans WHERE date = ? ORDER BY created_at DESC", (date,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM trade_plans ORDER BY created_at DESC LIMIT 50").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def get_debates(date: Optional[str] = None, ticker: Optional[str] = None) -> List[dict]:
     conn = get_conn()
-    query = "SELECT * FROM debates WHERE 1=1"
-    params = []
-    if date:
-        query += " AND date = ?"
-        params.append(date)
-    if ticker:
-        query += " AND ticker = ?"
-        params.append(ticker)
-    query += " ORDER BY created_at DESC LIMIT 100"
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        query = "SELECT * FROM debates WHERE 1=1"
+        params = []
+        if date:
+            query += " AND date = ?"
+            params.append(date)
+        if ticker:
+            query += " AND ticker = ?"
+            params.append(ticker)
+        query += " ORDER BY created_at DESC LIMIT 100"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def get_positions(status: Optional[str] = None) -> List[dict]:
     conn = get_conn()
-    if status:
-        rows = conn.execute("SELECT * FROM positions WHERE status = ? ORDER BY opened_at DESC", (status,)).fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM positions ORDER BY opened_at DESC LIMIT 100").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        if status:
+            rows = conn.execute("SELECT * FROM positions WHERE status = ? ORDER BY opened_at DESC", (status,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM positions ORDER BY opened_at DESC LIMIT 100").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def get_daily_metrics() -> List[dict]:
     conn = get_conn()
-    rows = conn.execute("SELECT * FROM daily_metrics ORDER BY date DESC LIMIT 90").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        rows = conn.execute("SELECT * FROM daily_metrics ORDER BY date DESC LIMIT 90").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def get_latest_capital(default: float, before_date: Optional[str] = None) -> float:
@@ -413,32 +453,36 @@ def get_latest_capital(default: float, before_date: Optional[str] = None) -> flo
     doesn't double-count.
     """
     conn = get_conn()
-    if before_date:
-        row = conn.execute(
-            "SELECT capital FROM daily_metrics WHERE date < ? ORDER BY date DESC LIMIT 1",
-            (before_date,),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT capital FROM daily_metrics ORDER BY date DESC LIMIT 1"
-        ).fetchone()
-    conn.close()
-    if row and row["capital"] is not None:
-        return float(row["capital"])
-    return float(default)
+    try:
+        if before_date:
+            row = conn.execute(
+                "SELECT capital FROM daily_metrics WHERE date < ? ORDER BY date DESC LIMIT 1",
+                (before_date,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT capital FROM daily_metrics ORDER BY date DESC LIMIT 1"
+            ).fetchone()
+        if row and row["capital"] is not None:
+            return float(row["capital"])
+        return float(default)
+    finally:
+        conn.close()
 
 
 def get_agent_reports(date: Optional[str] = None, ticker: Optional[str] = None) -> List[dict]:
     conn = get_conn()
-    query = "SELECT * FROM agent_reports WHERE 1=1"
-    params = []
-    if date:
-        query += " AND date = ?"
-        params.append(date)
-    if ticker:
-        query += " AND ticker = ?"
-        params.append(ticker)
-    query += " ORDER BY created_at DESC LIMIT 200"
-    rows = conn.execute(query, params).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        query = "SELECT * FROM agent_reports WHERE 1=1"
+        params = []
+        if date:
+            query += " AND date = ?"
+            params.append(date)
+        if ticker:
+            query += " AND ticker = ?"
+            params.append(ticker)
+        query += " ORDER BY created_at DESC LIMIT 200"
+        rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()

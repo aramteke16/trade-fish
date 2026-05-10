@@ -1,16 +1,43 @@
 import React, { useEffect, useState } from 'react'
 import { getConfig, patchConfig, resetConfig } from '../api'
 
-function inputFor(item, value, onChange) {
+function inputFor(item, value, onChange, allItems) {
   const base = {
     width: '100%', padding: '6px 8px', fontSize: 13, borderRadius: 2,
     border: '1px solid #222', background: '#000', color: '#e5e5e5', outline: 'none',
   }
+
+  if (item.input_type === 'time') {
+    return <input style={base} type="time" value={value ?? ''} onChange={(e) => onChange(e.target.value)} />
+  }
+
+  // Provider-bound model dropdown
+  if (item.provider_models) {
+    const providerItem = allItems.find((i) => i.key === 'llm_provider')
+    const provider = providerItem?.value || ''
+    const models = item.provider_models[provider] || []
+    if (models.length > 0) {
+      return (
+        <select style={base} value={value ?? ''} onChange={(e) => onChange(e.target.value)}>
+          {!models.includes(value) && value && <option value={value}>{value}</option>}
+          {models.map((m) => (
+            <option key={m} value={m}>{m}</option>
+          ))}
+        </select>
+      )
+    }
+    return <input style={base} type="text" value={value ?? ''} placeholder="Enter model name"
+                  onChange={(e) => onChange(e.target.value)} />
+  }
+
   if (item.options && Array.isArray(item.options)) {
     return (
-      <select style={base} value={value ?? ''} onChange={(e) => onChange(e.target.value)}>
+      <select style={base} value={value ?? ''} onChange={(e) => {
+        const v = e.target.value
+        onChange(v === '' || v === 'null' ? null : v)
+      }}>
         {item.options.map((opt) => (
-          <option key={opt} value={opt}>{opt}</option>
+          <option key={String(opt)} value={opt ?? 'null'}>{opt === null ? '(none)' : opt}</option>
         ))}
       </select>
     )
@@ -43,6 +70,18 @@ function inputFor(item, value, onChange) {
   return <input style={base} type="text" value={value ?? ''} onChange={(e) => onChange(e.target.value)} />
 }
 
+const PROVIDER_KEY_MAP = {
+  moonshot: 'moonshot_api_key',
+  anthropic: 'anthropic_api_key',
+  openai: 'openai_api_key',
+  google: 'google_api_key',
+  xai: 'xai_api_key',
+  deepseek: 'deepseek_api_key',
+  qwen: 'dashscope_api_key',
+  glm: 'zhipu_api_key',
+  openrouter: 'openrouter_api_key',
+}
+
 export default function SettingsForm() {
   const [grouped, setGrouped] = useState({})
   const [drafts, setDrafts] = useState({})
@@ -59,6 +98,12 @@ export default function SettingsForm() {
   function setDraft(key, val) {
     setDrafts((d) => ({ ...d, [key]: val }))
   }
+
+  // Flat list of all items for cross-referencing (provider lookup)
+  const allItems = Object.values(grouped).flat().map((item) => {
+    if (drafts.hasOwnProperty(item.key)) return { ...item, value: drafts[item.key] }
+    return item
+  })
 
   async function saveOne(item) {
     setBusy(true); setMsg(null)
@@ -106,6 +151,13 @@ export default function SettingsForm() {
             {cat}
           </div>
           {grouped[cat].map((item) => {
+            if (item.is_secret && item.key.endsWith('_api_key')) {
+              const currentProvider = allItems.find((i) => i.key === 'llm_provider')?.value
+              if (currentProvider) {
+                const activeKey = PROVIDER_KEY_MAP[currentProvider]
+                if (!activeKey || item.key !== activeKey) return null
+              }
+            }
             const draft = drafts.hasOwnProperty(item.key) ? drafts[item.key] : item.value
             const dirty = drafts.hasOwnProperty(item.key) && drafts[item.key] !== item.value
             return (
@@ -117,7 +169,7 @@ export default function SettingsForm() {
                   <div style={{ fontSize: 13, fontWeight: 500 }}>{item.key}</div>
                   <div style={{ color: '#444', fontSize: 11, marginTop: 2 }}>{item.description}</div>
                 </div>
-                <div>{inputFor(item, draft, (v) => setDraft(item.key, v))}</div>
+                <div>{inputFor(item, draft, (v) => setDraft(item.key, v), allItems)}</div>
                 <div>
                   <button
                     onClick={() => saveOne(item)}
