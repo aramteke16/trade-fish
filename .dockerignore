@@ -1,0 +1,31 @@
+# Keep the build context small. node_modules + .venv alone are ~400 MB.
+.git
+.gitignore
+.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.egg-info
+build
+dist
+.pytest_cache
+.mypy_cache
+
+# Frontend tooling artefacts — Stage 1 reinstalls deps and rebuilds.
+frontend/node_modules
+frontend/dist
+
+# Local data / outputs that have no business in the image.
+data
+reports
+logs
+*.db
+*.sqlite*
+.env
+.env.*
+
+# Editor / OS junk
+.vscode
+.idea
+.DS_Store

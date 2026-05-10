@@ -1,0 +1,209 @@
+"""Static defaults + metadata for the DB-backed config service.
+
+This module is the **seed source** for the ``app_config`` SQLite table. On
+first boot (or when the table is empty), every key in ``DEFAULT_CONFIG`` is
+inserted into the DB. From that point on, the runtime reads config from the
+DB via ``tradingagents.web.config_service.get_full_config_with_env_overrides``,
+which lets the user edit values via REST/UI without redeploying.
+
+Storage path resolution (``_resolve_home``):
+  1. ``TRADINGAGENTS_HOME`` env var — explicit override.
+  2. ``/data`` if it exists and is writable — the cloud-volume convention
+     (Render, Fly, ECS, GKE all mount persistent volumes there by default).
+  3. ``~/.tradingagents`` — local-dev fallback.
+
+Same priority chain applies to all derived paths (logs/, cache/, memory/,
+reports/) and to the SQLite DB file itself in ``web/database.py``.
+"""
+
+import os
+
+
+def _resolve_home() -> str:
+    """Pick the base directory for all persistent state.
+
+    See module docstring for the priority chain.
+    """
+    explicit = os.getenv("TRADINGAGENTS_HOME")
+    if explicit:
+        return explicit
+    cloud_default = "/data"
+    if os.path.isdir(cloud_default) and os.access(cloud_default, os.W_OK):
+        return cloud_default
+    return os.path.join(os.path.expanduser("~"), ".tradingagents")
+
+
+_TRADINGAGENTS_HOME = _resolve_home()
+
+
+DEFAULT_CONFIG = {
+    "project_dir": os.path.abspath(os.path.join(os.path.dirname(__file__), ".")),
+    "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR", os.path.join(_TRADINGAGENTS_HOME, "logs")),
+    "data_cache_dir": os.getenv("TRADINGAGENTS_CACHE_DIR", os.path.join(_TRADINGAGENTS_HOME, "cache")),
+    "memory_log_path": os.getenv("TRADINGAGENTS_MEMORY_LOG_PATH", os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md")),
+    "reports_dir": os.getenv("TRADINGAGENTS_REPORTS_DIR", os.path.join(_TRADINGAGENTS_HOME, "reports")),
+    # Cap on resolved memory log entries. 800 ≈ 12 months at 3 trades/day.
+    # None disables rotation (unbounded).
+    "memory_log_max_entries": 800,
+    # LLM settings
+    "llm_provider": "moonshot",
+    "deep_think_llm": "kimi-k2.6",
+    "quick_think_llm": "kimi-k2.5",
+    "backend_url": None,
+    # Provider-specific thinking configuration
+    "google_thinking_level": None,
+    "openai_reasoning_effort": None,
+    "anthropic_effort": None,
+    "claude_mode": None,
+    # Moonshot Kimi configuration
+    "moonshot_api_key": None,
+    "moonshot_base_url": "https://api.moonshot.ai/v1",
+    # Indian market settings
+    "market_timezone": "Asia/Kolkata",
+    "market_open": "09:15",
+    "market_close": "15:30",
+    "execution_window_start": "10:30",
+    "execution_window_end": "15:15",
+    "initial_capital": 20000,
+    "capital_currency": "INR",
+    "max_capital_per_stock_pct": 25,
+    "max_loss_per_trade_pct": 1.5,
+    "daily_loss_limit_pct": 3.0,
+    "weekly_loss_limit_pct": 5.0,
+    "hard_exit_time": "15:15",
+    "skip_rule_time": "11:30",
+    "min_liquidity_inr_crores": 5,
+    # Cross-stock allocator (Phase 2.5)
+    "top_k_positions": 3,
+    "deploy_pct_top_k": 70.0,
+    "target_daily_return_pct": 1.0,
+    # Live monitor (Phase 4) — trailing-stop ladder
+    "poll_interval_sec": 600,
+    "breakeven_trigger_pct": 0.5,
+    "trail_trigger_pct": 1.0,
+    "trail_lock_pct": 0.3,
+    # Mid-day news-event monitor
+    "news_check_enabled": True,
+    "news_check_lookback_min": 60,
+    # End-of-day reflection sweep
+    "eod_reflection_enabled": True,
+    "eod_news_window_start": "09:00",
+    "eod_news_window_end": "15:30",
+    # Cron dispatcher (state-machine driven; see tradingagents/pipeline/dispatcher.py)
+    # The dispatcher wakes on `dispatcher_*_interval_sec` and acts based on
+    # the current row in the `pipeline_state` table. Edit these via PATCH
+    # /api/config/key/... and the next dispatcher tick will pick them up.
+    "dispatcher_idle_interval_sec": 3600,       # how often to check during idle/holiday
+    "dispatcher_waiting_interval_sec": 60,      # poll cadence between precheck and 09:30 execution
+    "dispatcher_monitor_interval_sec": 600,     # poll cadence between 09:30 and 15:15 (10 min)
+    "precheck_time": "08:10",                   # IST. Idle handler fires precheck after this.
+    "execution_time": "09:30",                  # IST. Waiting handler places orders at/after this.
+    # Checkpoint/resume
+    "checkpoint_enabled": False,
+    # Output language for analyst reports and final decision
+    "output_language": "English",
+    # Debate and discussion settings
+    "max_debate_rounds": 2,
+    "max_risk_discuss_rounds": 2,
+    "max_recur_limit": 100,
+    # Data vendor configuration (nested dicts; serialized as JSON in the DB row)
+    "data_vendors": {
+        "core_stock_apis": "yfinance",
+        "technical_indicators": "yfinance",
+        "fundamental_data": "yfinance",
+        "news_data": "yfinance",
+    },
+    "tool_vendors": {},
+}
+
+
+# ---------------------------------------------------------------------------
+# CONFIG_METADATA — category + secrecy + tooltip text per key.
+#
+# Used by:
+#   - seed_default_config_if_empty() to populate app_config rows
+#   - GET /api/config to group keys for the UI and mask secrets
+#   - PATCH /api/config to validate that the key is known
+#
+# Categories drive the UI grouping. "storage" rows are read with env-var
+# precedence (env var > DB > seed default) so cloud overrides keep working.
+# "secret" rows are masked as "***" in GET responses but pass through fully
+# to the LLM clients via load_config().
+# ---------------------------------------------------------------------------
+CONFIG_METADATA = {
+    # Storage paths
+    "project_dir":     {"category": "storage", "is_secret": False, "description": "Package install directory (read-only, derived)."},
+    "results_dir":     {"category": "storage", "is_secret": False, "description": "Per-run JSON state dumps from LangGraph."},
+    "data_cache_dir":  {"category": "storage", "is_secret": False, "description": "yfinance / data fetch cache directory."},
+    "memory_log_path": {"category": "storage", "is_secret": False, "description": "Markdown reflections log used as PM context."},
+    "reports_dir":     {"category": "storage", "is_secret": False, "description": "Daily multi-agent markdown reports root: <reports_dir>/<DATE>/<TICKER>/."},
+    "memory_log_max_entries": {"category": "storage", "is_secret": False, "description": "Cap on resolved memory entries; older ones pruned. None = unlimited."},
+
+    # LLM provider settings
+    "llm_provider":            {"category": "llm", "is_secret": False, "description": "Active LLM vendor: moonshot, anthropic, openai, google, ollama."},
+    "deep_think_llm":           {"category": "llm", "is_secret": False, "description": "Model for slow / high-reasoning calls (PM, Research Manager)."},
+    "quick_think_llm":          {"category": "llm", "is_secret": False, "description": "Model for fast / cheap calls (analysts, classifiers)."},
+    "backend_url":              {"category": "llm", "is_secret": False, "description": "Provider base URL override; null = vendor default."},
+    "google_thinking_level":    {"category": "llm", "is_secret": False, "description": "Gemini thinking budget: high / minimal / null."},
+    "openai_reasoning_effort":  {"category": "llm", "is_secret": False, "description": "OpenAI o-series reasoning effort: low / medium / high."},
+    "anthropic_effort":         {"category": "llm", "is_secret": False, "description": "Anthropic extended thinking effort: low / medium / high."},
+    "claude_mode":              {"category": "llm", "is_secret": False, "description": "Claude transport: 'api' (direct) or 'cli' (Bedrock proxy)."},
+    "output_language":          {"category": "llm", "is_secret": False, "description": "Output language for user-facing analyst reports."},
+    "moonshot_api_key":         {"category": "llm", "is_secret": True,  "description": "Moonshot Kimi API key. Used by every LLM call when llm_provider=moonshot."},
+    "moonshot_base_url":        {"category": "llm", "is_secret": False, "description": "Moonshot API base URL; rarely changed."},
+
+    # Indian market & execution window
+    "market_timezone":         {"category": "market", "is_secret": False, "description": "IANA timezone for market clock (default Asia/Kolkata)."},
+    "market_open":             {"category": "market", "is_secret": False, "description": "NSE open in IST. Used by is_market_open()."},
+    "market_close":            {"category": "market", "is_secret": False, "description": "NSE close in IST."},
+    "execution_window_start":  {"category": "market", "is_secret": False, "description": "Earliest entry time (IST). Pipeline waits until then."},
+    "execution_window_end":    {"category": "market", "is_secret": False, "description": "Latest entry time (IST). After this, no new entries."},
+    "hard_exit_time":          {"category": "market", "is_secret": False, "description": "Force-close all open positions at this time (IST)."},
+    "skip_rule_time":          {"category": "market", "is_secret": False, "description": "Default skip-rule cutoff if PM doesn't set one."},
+
+    # Capital & risk
+    "initial_capital":           {"category": "risk", "is_secret": False, "description": "Starting capital on first run. Subsequent runs use yesterday's EOD."},
+    "capital_currency":          {"category": "risk", "is_secret": False, "description": "Display currency for capital + P&L."},
+    "max_capital_per_stock_pct": {"category": "risk", "is_secret": False, "description": "Hard cap on capital deployed to any single stock (% of total)."},
+    "max_loss_per_trade_pct":    {"category": "risk", "is_secret": False, "description": "Per-trade risk budget (% of capital). Drives position sizing."},
+    "daily_loss_limit_pct":      {"category": "risk", "is_secret": False, "description": "Daily loss circuit breaker (% of initial). Trading pauses if hit."},
+    "weekly_loss_limit_pct":     {"category": "risk", "is_secret": False, "description": "Weekly loss circuit breaker (% of initial)."},
+    "min_liquidity_inr_crores":  {"category": "risk", "is_secret": False, "description": "Minimum daily-volume × price for screener (in ₹ crores)."},
+    "target_daily_return_pct":   {"category": "risk", "is_secret": False, "description": "Informational target; allocator sizes for this."},
+
+    # Allocator
+    "top_k_positions":   {"category": "allocator", "is_secret": False, "description": "How many top-scored stocks to actually trade each day."},
+    "deploy_pct_top_k":  {"category": "allocator", "is_secret": False, "description": "Total capital % deployed across top-K (half-Kelly cap)."},
+
+    # Live-monitor knobs
+    "poll_interval_sec":     {"category": "monitor", "is_secret": False, "description": "Seconds between price polls during execution window."},
+    "breakeven_trigger_pct": {"category": "monitor", "is_secret": False, "description": "When unrealized P&L hits this %, raise SL to entry."},
+    "trail_trigger_pct":     {"category": "monitor", "is_secret": False, "description": "When unrealized P&L hits this %, raise SL to entry+lock_pct."},
+    "trail_lock_pct":        {"category": "monitor", "is_secret": False, "description": "Locked-in profit floor (% above entry) once trail trigger fires."},
+
+    # News + EOD reflection
+    "news_check_enabled":     {"category": "news_eod", "is_secret": False, "description": "Run mid-day news classifier on each poll."},
+    "news_check_lookback_min": {"category": "news_eod", "is_secret": False, "description": "How far back to scan news (minutes) per poll."},
+    "eod_reflection_enabled": {"category": "news_eod", "is_secret": False, "description": "Run post-market per-trade reflection sweep."},
+    "eod_news_window_start":  {"category": "news_eod", "is_secret": False, "description": "Start of trade-day news window for EOD reflection (IST)."},
+    "eod_news_window_end":    {"category": "news_eod", "is_secret": False, "description": "End of trade-day news window for EOD reflection (IST)."},
+
+    # Debate / agent rounds
+    "max_debate_rounds":       {"category": "debate", "is_secret": False, "description": "Bull/Bear debate rounds per stock."},
+    "max_risk_discuss_rounds": {"category": "debate", "is_secret": False, "description": "Aggressive/Conservative/Neutral debate rounds per stock."},
+    "max_recur_limit":         {"category": "debate", "is_secret": False, "description": "LangGraph recursion limit (safety bound)."},
+
+    # Data vendors
+    "data_vendors": {"category": "vendors", "is_secret": False, "description": "Default vendor per data category. JSON object."},
+    "tool_vendors": {"category": "vendors", "is_secret": False, "description": "Tool-level vendor overrides. JSON object."},
+
+    # System
+    "checkpoint_enabled": {"category": "system", "is_secret": False, "description": "LangGraph checkpoint/resume after each node."},
+
+    # Cron dispatcher (state-machine driven)
+    "dispatcher_idle_interval_sec":    {"category": "dispatcher", "is_secret": False, "description": "Seconds between dispatcher wakes during idle/holiday state. Default 3600 = 1 hr."},
+    "dispatcher_waiting_interval_sec": {"category": "dispatcher", "is_secret": False, "description": "Seconds between dispatcher wakes after precheck, until 09:30 execution. Default 60 = 1 min."},
+    "dispatcher_monitor_interval_sec": {"category": "dispatcher", "is_secret": False, "description": "Seconds between dispatcher wakes during the 09:30-15:15 monitoring window. Default 600 = 10 min."},
+    "precheck_time":                    {"category": "dispatcher", "is_secret": False, "description": "IST time at or after which idle state fires precheck. Format HH:MM."},
+    "execution_time":                   {"category": "dispatcher", "is_secret": False, "description": "IST time at or after which waiting state places orders. Format HH:MM."},
+}
