@@ -2,7 +2,6 @@ import React, { useState } from 'react'
 import usePolling from '../hooks/usePolling'
 import { getGlobalSummary, getLossAttribution } from '../api'
 import SummaryCards from '../components/SummaryCards'
-import ResetCapitalModal from '../components/ResetCapitalModal'
 import PnLPatternChart from '../components/PnLPatternChart'
 import LossAttributionDrawer from '../components/LossAttributionDrawer'
 import AnalyzeStockBox from '../components/AnalyzeStockBox'
@@ -18,7 +17,6 @@ const section = {
 export default function Home() {
   const summaryQ = usePolling(getGlobalSummary, 10000)
   const lossQ = usePolling(() => getLossAttribution(60), 30000)
-  const [resetOpen, setResetOpen] = useState(false)
   const [drawerDay, setDrawerDay] = useState(null)
   const [refreshKey, setRefreshKey] = useState(0)
 
@@ -29,15 +27,6 @@ export default function Home() {
     <div>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 8 }}>
         <h1 style={{ margin: 0, fontSize: 18, fontWeight: 600 }}>Home</h1>
-        {summary?.paper_mode && (
-          <button
-            onClick={() => setResetOpen(true)}
-            style={{
-              background: 'transparent', color: '#666', border: '1px solid #222',
-              padding: '5px 12px', borderRadius: 2, cursor: 'pointer', fontSize: 12,
-            }}
-          >Reset Capital</button>
-        )}
       </div>
 
       <div style={{ marginBottom: 16 }}>
@@ -61,12 +50,6 @@ export default function Home() {
 
       <OnDemandList refreshKey={refreshKey} />
 
-      <ResetCapitalModal
-        open={resetOpen}
-        onClose={() => setResetOpen(false)}
-        onDone={() => summaryQ.refresh()}
-        initialCapital={summary?.initial_capital}
-      />
       <LossAttributionDrawer day={drawerDay} onClose={() => setDrawerDay(null)} />
     </div>
   )

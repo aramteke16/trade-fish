@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { getConfig, patchConfig, resetConfig } from '../api'
+import ResetCapitalModal from './ResetCapitalModal'
 
 function inputFor(item, value, onChange, allItems) {
   const base = {
@@ -87,6 +88,7 @@ export default function SettingsForm() {
   const [drafts, setDrafts] = useState({})
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState(null)
+  const [resetCapitalOpen, setResetCapitalOpen] = useState(false)
 
   async function load() {
     const g = await getConfig()
@@ -187,6 +189,22 @@ export default function SettingsForm() {
           })}
         </div>
       ))}
+
+      <div style={{ borderTop: '1px solid #1a1a1a', marginTop: 24, paddingTop: 20, display: 'flex', justifyContent: 'flex-end' }}>
+        <button
+          onClick={() => setResetCapitalOpen(true)}
+          style={{
+            background: 'transparent', color: '#c33', border: '1px solid #c33',
+            padding: '6px 16px', borderRadius: 2, cursor: 'pointer', fontSize: 12, fontWeight: 600,
+          }}
+        >Reset Paper Capital</button>
+      </div>
+
+      <ResetCapitalModal
+        open={resetCapitalOpen}
+        onClose={() => setResetCapitalOpen(false)}
+        onDone={() => setMsg('Capital reset successfully.')}
+      />
     </div>
   )
 }

@@ -2,6 +2,17 @@ import React, { useState } from 'react'
 import usePolling from '../hooks/usePolling'
 import { getAnalyses, getAnalysisReport, downloadFileUrl } from '../api'
 
+function formatDuration(requestedAt, completedAt) {
+  if (!requestedAt || !completedAt) return null
+  const ms = new Date(completedAt) - new Date(requestedAt)
+  if (ms < 0) return null
+  const totalSec = Math.round(ms / 1000)
+  if (totalSec < 60) return `${totalSec}s`
+  const min = Math.floor(totalSec / 60)
+  const sec = totalSec % 60
+  return sec > 0 ? `${min}m ${sec}s` : `${min}m`
+}
+
 export default function OnDemandList({ refreshKey }) {
   const { data } = usePolling(getAnalyses, 5000, [refreshKey])
   const analyses = data?.analyses || []
@@ -43,9 +54,24 @@ export default function OnDemandList({ refreshKey }) {
               padding: '10px 0', fontSize: 13, cursor: 'pointer',
             }}
           >
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
               <span style={{ fontWeight: 600 }}>{a.ticker}</span>
+              <span style={{ color: '#333', fontSize: 11 }}>{'>'}</span>
               <span style={{ color: '#333', fontSize: 11 }}>{a.requested_at?.replace('T', ' ').slice(0, 19)}</span>
+              {a.completed_at && (
+                <>
+                  <span style={{ color: '#333', fontSize: 11 }}>{'>'}</span>
+                  <span style={{ color: a.status === 'error' ? '#663333' : '#336633', fontSize: 11 }}>
+                    {formatDuration(a.requested_at, a.completed_at)}
+                  </span>
+                </>
+              )}
+              {(a.status === 'running' || a.status === 'pending') && (
+                <>
+                  <span style={{ color: '#333', fontSize: 11 }}>{'>'}</span>
+                  <span style={{ color: '#555', fontSize: 11 }}>running...</span>
+                </>
+              )}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               {a.status === 'done' && a.report_path && (

@@ -147,7 +147,7 @@ CONFIG_METADATA = {
     "deep_think_llm":           {"category": "llm", "is_secret": False, "description": "Model for high-reasoning calls (PM, Research Manager).",
                                 "provider_models": {
                                     "moonshot": ["kimi-k2.6", "kimi-k2.5"],
-                                    "anthropic": ["claude-sonnet-4-6", "claude-opus-4-0-20250115"],
+                                    "anthropic": ["claude-opus-4-7", "claude-sonnet-4-6"],
                                     "openai": ["gpt-4o", "o3-mini"],
                                     "google": ["gemini-2.5-pro"],
                                     "xai": ["grok-3"],
@@ -160,7 +160,7 @@ CONFIG_METADATA = {
     "quick_think_llm":          {"category": "llm", "is_secret": False, "description": "Model for fast / cheap calls (analysts, classifiers).",
                                 "provider_models": {
                                     "moonshot": ["kimi-k2.5", "moonshot-v1-128k"],
-                                    "anthropic": ["claude-haiku-4-5-20251001", "claude-sonnet-4-6"],
+                                    "anthropic": ["claude-haiku-4-5", "claude-sonnet-4-6"],
                                     "openai": ["gpt-4o-mini", "gpt-4o"],
                                     "google": ["gemini-2.0-flash", "gemini-2.5-pro"],
                                     "xai": ["grok-3-mini", "grok-3"],
