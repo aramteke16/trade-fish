@@ -18,7 +18,7 @@ export default function PipelineStateBadge() {
         background: isActive ? '#e5e5e5' : '#333',
       }} />
       <span style={{ fontWeight: 500, fontSize: 12 }}>{state}</span>
-      {since && <span style={{ color: '#444', fontSize: 11 }}>{since.slice(11, 16)}</span>}
+      {since && <span style={{ color: '#444', fontSize: 11 }}>{new Date(since).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })}</span>}
     </div>
   )
 }

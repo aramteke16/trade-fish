@@ -83,8 +83,8 @@ def read_state() -> StateRow:
         # Self-heal: re-insert the seed row.
         conn.execute(
             "INSERT OR REPLACE INTO pipeline_state (id, state, state_since) "
-            "VALUES (1, ?, CURRENT_TIMESTAMP)",
-            (STATE_IDLE,),
+            "VALUES (1, ?, ?)",
+            (STATE_IDLE, datetime.now(IST).isoformat()),
         )
         conn.commit()
         conn.close()
@@ -153,12 +153,13 @@ def transition_to(
         ).fetchone()
         from_state = prev["state"] if prev else None
 
+        now_ist = datetime.now(IST).isoformat()
         conn.execute(
             "UPDATE pipeline_state SET "
-            "state = ?, state_since = CURRENT_TIMESTAMP, "
+            "state = ?, state_since = ?, "
             "trade_date = ?, next_run_at = ?, last_error = ?, payload = ? "
             "WHERE id = 1",
-            (new_state, trade_date, next_run_iso, last_error, payload_json),
+            (new_state, now_ist, trade_date, next_run_iso, last_error, payload_json),
         )
         conn.execute(
             "INSERT INTO pipeline_state_history (from_state, to_state, note) "

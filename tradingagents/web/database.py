@@ -211,9 +211,11 @@ def init_db():
     # (e.g., when a new field is added in a future version).
     _seed_default_config_if_empty(conn)
     # Seed the single pipeline_state row in the same idempotent style.
+    from tradingagents.dataflows.indian_market import IST
     conn.execute(
         "INSERT OR IGNORE INTO pipeline_state (id, state, state_since) "
-        "VALUES (1, 'idle', CURRENT_TIMESTAMP)"
+        "VALUES (1, 'idle', ?)",
+        (datetime.now(IST).isoformat(),),
     )
     conn.commit()
     conn.close()
