@@ -191,8 +191,7 @@ def dispatch_pipeline() -> None:
         _reschedule(int(cfg.get("dispatcher_idle_interval_sec", 3600)))
         return
 
-    if next_state != state_row.state:
-        sm.transition_to(next_state, trade_date=state_row.trade_date)
+    sm.transition_to(next_state, trade_date=state_row.trade_date)
     _reschedule(next_interval)
 
 
