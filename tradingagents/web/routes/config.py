@@ -33,6 +33,7 @@ from ..config_service import (
     set_config,
     set_config_bulk,
 )
+from tradingagents.pipeline.dispatcher import _reschedule
 
 router = APIRouter()
 
@@ -97,6 +98,7 @@ def patch_one_key(key: str, body: SingleUpdate):
         new_value = set_config(key, body.value)
     except ConfigError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _reschedule(1)
     return {"key": key, "value": new_value}
 
 
@@ -110,6 +112,7 @@ def patch_bulk(updates: dict = Body(...)):
         applied = set_config_bulk(updates)
     except ConfigError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    _reschedule(1)
     return {"applied": applied, "count": len(applied)}
 
 

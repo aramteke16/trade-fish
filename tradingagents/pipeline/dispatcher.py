@@ -159,6 +159,7 @@ def dispatch_pipeline() -> None:
     cfg = load_config()
     now = datetime.now(IST)
     state_row = sm.read_state()
+    logger.info("dispatcher tick: state=%s, now=%s", state_row.state, now.strftime("%H:%M:%S"))
 
     # Hard global shortcut: market closed → don't bother running any handler.
     # Exception: if we're already in ``analysis``, let it run so EOD reflection

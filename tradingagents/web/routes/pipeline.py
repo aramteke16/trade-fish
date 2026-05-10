@@ -116,3 +116,12 @@ def post_run_now(stage: str):
         "next_state": next_state,
         "next_interval_sec": next_interval,
     }
+
+
+@router.post("/pipeline/kick")
+def post_kick():
+    """Force the dispatcher to fire on the next second and pick up any
+    config changes (e.g. updated interval). Without this, you'd have to
+    wait for the current interval to expire."""
+    dispatcher._reschedule(1)
+    return {"ok": True, "detail": "Dispatcher will fire within 1 second"}
