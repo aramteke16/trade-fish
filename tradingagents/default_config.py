@@ -96,15 +96,10 @@ DEFAULT_CONFIG = {
     "eod_reflection_enabled": True,
     "eod_news_window_start": "09:00",
     "eod_news_window_end": "15:30",
-    # Cron dispatcher (state-machine driven; see tradingagents/pipeline/dispatcher.py)
-    # The dispatcher wakes on `dispatcher_*_interval_sec` and acts based on
-    # the current row in the `pipeline_state` table. Edit these via PATCH
-    # /api/config/key/... and the next dispatcher tick will pick them up.
-    "dispatcher_idle_interval_sec": 3600,       # how often to check during idle/holiday
-    "dispatcher_waiting_interval_sec": 60,      # poll cadence between precheck and 09:30 execution
-    "dispatcher_monitor_interval_sec": 600,     # poll cadence between 09:30 and 15:15 (10 min)
-    "precheck_time": "08:10",                   # IST. Idle handler fires precheck after this.
-    "execution_time": "09:30",                  # IST. Waiting handler places orders at/after this.
+    # Cron dispatcher — fixed 60s tick, time-based state transitions.
+    "dispatcher_monitor_interval_sec": 600,     # throttle monitor.tick() to every N seconds
+    "precheck_time": "08:10",                   # IST. Idle→precheck after this.
+    "execution_time": "09:30",                  # IST. Waiting→monitor after this.
     # Checkpoint/resume
     "checkpoint_enabled": False,
     # Output language for analyst reports and final decision
@@ -214,10 +209,8 @@ CONFIG_METADATA = {
     # System
     "checkpoint_enabled": {"category": "system", "is_secret": False, "description": "LangGraph checkpoint/resume after each node."},
 
-    # Cron dispatcher (state-machine driven)
-    "dispatcher_idle_interval_sec":    {"category": "dispatcher", "is_secret": False, "description": "Seconds between dispatcher wakes during idle/holiday state. Default 3600 = 1 hr."},
-    "dispatcher_waiting_interval_sec": {"category": "dispatcher", "is_secret": False, "description": "Seconds between dispatcher wakes after precheck, until 09:30 execution. Default 60 = 1 min."},
-    "dispatcher_monitor_interval_sec": {"category": "dispatcher", "is_secret": False, "description": "Seconds between dispatcher wakes during the 09:30-15:15 monitoring window. Default 600 = 10 min."},
-    "precheck_time":                    {"category": "dispatcher", "is_secret": False, "description": "IST time at or after which idle state fires precheck. Format HH:MM."},
-    "execution_time":                   {"category": "dispatcher", "is_secret": False, "description": "IST time at or after which waiting state places orders. Format HH:MM."},
+    # Cron dispatcher (fixed 60s tick)
+    "dispatcher_monitor_interval_sec": {"category": "dispatcher", "is_secret": False, "description": "Throttle monitor.tick() to run every N seconds (default 600 = 10 min)."},
+    "precheck_time":                    {"category": "dispatcher", "is_secret": False, "description": "IST time to start precheck. Format HH:MM."},
+    "execution_time":                   {"category": "dispatcher", "is_secret": False, "description": "IST time to place orders. Format HH:MM."},
 }

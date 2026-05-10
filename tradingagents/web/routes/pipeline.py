@@ -99,29 +99,15 @@ def post_run_now(stage: str):
     state_row = sm.read_state()
 
     try:
-        next_state, next_interval = handler(now, state_row, cfg)
+        next_state = handler(now, state_row, cfg)
     except Exception as e:
         logger.exception("manual run-now %s threw", stage)
         raise HTTPException(status_code=500, detail=str(e))
 
-    if next_state != state_row.state:
+    if next_state is not None and next_state != state_row.state:
         sm.transition_to(next_state, note=f"manual run-now {stage!r}")
-
-    # Reschedule the dispatcher so it picks up from the new state in the
-    # right cadence — same as a normal tick.
-    dispatcher._reschedule(int(next_interval))
 
     return {
         "ran_stage": stage,
-        "next_state": next_state,
-        "next_interval_sec": next_interval,
+        "next_state": next_state or state_row.state,
     }
-
-
-@router.post("/pipeline/kick")
-def post_kick():
-    """Force the dispatcher to fire on the next second and pick up any
-    config changes (e.g. updated interval). Without this, you'd have to
-    wait for the current interval to expire."""
-    dispatcher._reschedule(1)
-    return {"ok": True, "detail": "Dispatcher will fire within 1 second"}
