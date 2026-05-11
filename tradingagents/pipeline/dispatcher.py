@@ -177,10 +177,12 @@ def dispatch_pipeline() -> None:
         if _background_future is not None:
             if not _background_future.done():
                 elapsed = _time.time() - (_background_started_at or 0)
-                logger.info(
-                    "[bg] %s still running (%.0fs elapsed)",
-                    state_row.state, elapsed,
-                )
+                # Log only every 5 minutes to avoid spam
+                if int(elapsed) % 300 < TICK_INTERVAL_SEC:
+                    logger.info(
+                        "[bg] %s still running (%.0fm elapsed)",
+                        state_row.state, elapsed / 60,
+                    )
                 sm.touch_state_since()
                 return
 
@@ -254,20 +256,29 @@ def handle_precheck(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optiona
 
     from run_pipeline import run_analysis_phase, run_screener
 
-    top_n = int(cfg.get("top_k_positions", 3))
-    logger.info("[precheck] running screener (top_n=%d)", top_n)
-    top_stocks = run_screener(top_n=top_n)
-    if not top_stocks:
-        logger.info("[precheck] no stocks passed screening; back to idle")
-        return STATE_IDLE
+    dry_run = bool(cfg.get("dry_run_e2e", False))
+    if dry_run:
+        ticker = cfg.get("dry_run_ticker", "RELIANCE.NS")
+        top_stocks = [{"ticker": ticker, "composite_score": 99, "price": 0, "avg_volume_inr_crores": 0, "atr_pct": 0}]
+        logger.info("[precheck] DRY RUN: skipping screener, analyzing ticker=%s", ticker)
+    else:
+        top_n = int(cfg.get("top_k_positions", 3))
+        logger.info("[precheck] running screener (top_n=%d)", top_n)
+        top_stocks = run_screener(top_n=top_n)
+        if not top_stocks:
+            logger.info("[precheck] no stocks passed screening; back to idle")
+            return STATE_IDLE
 
     plans = run_analysis_phase(top_stocks, date=trade_date)
+    if dry_run:
+        for p in plans:
+            p["is_dry_run"] = True
     runtime["plans"] = plans
     if not plans:
         logger.info("[precheck] no actionable plans; back to idle")
         return STATE_IDLE
 
-    logger.info("[precheck] %d actionable plans ready", len(plans))
+    logger.info("[precheck] %d actionable plans ready%s", len(plans), " [DRY RUN]" if dry_run else "")
     return STATE_WAITING
 
 
@@ -279,8 +290,17 @@ def handle_waiting(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
     runtime = _get_runtime(trade_date)
     plans = runtime.get("plans", [])
     if not plans:
-        logger.warning("[waiting] no cached plans; rerunning precheck")
-        return handle_precheck(now, state_row, cfg)
+        # In-memory cache lost (e.g. container restart) — reload from DB before
+        # falling back to a full precheck rerun.
+        from tradingagents.web.database import get_trade_plans
+        db_plans = [p for p in get_trade_plans(trade_date) if p.get("rating") == "Buy"]
+        if db_plans:
+            logger.info("[waiting] reloaded %d plan(s) from DB after cache miss", len(db_plans))
+            runtime["plans"] = db_plans
+            plans = db_plans
+        else:
+            logger.warning("[waiting] no cached plans and no DB plans; rerunning precheck")
+            return handle_precheck(now, state_row, cfg)
 
     from run_pipeline import run_execution_phase
     from tradingagents.execution.paper_trader import PaperTrader
@@ -307,14 +327,29 @@ def handle_waiting(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
 def handle_monitor(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional[str]:
     """Runs monitor.tick() throttled by dispatcher_monitor_interval_sec.
     Uses state_since to check elapsed time since last tick."""
-    monitor_interval = int(cfg.get("dispatcher_monitor_interval_sec", 600))
+    monitor_interval = 60 if cfg.get("dry_run_e2e") else int(cfg.get("dispatcher_monitor_interval_sec", 600))
     trade_date = now.strftime("%Y-%m-%d")
     runtime = _get_runtime(trade_date)
 
     paper_trader = runtime.get("paper_trader")
     if paper_trader is None:
-        logger.warning("[monitor] no cached paper_trader; jumping to analysis")
-        return STATE_ANALYSIS
+        # In-memory cache lost (container restart while in monitor state).
+        # Rebuild PaperTrader from today's DB plans so monitoring can continue.
+        from tradingagents.web.database import get_trade_plans, get_latest_capital
+        from tradingagents.execution.paper_trader import PaperTrader
+        from run_pipeline import run_execution_phase
+        db_plans = [p for p in get_trade_plans(trade_date) if p.get("rating") == "Buy"]
+        if not db_plans:
+            logger.warning("[monitor] no cached paper_trader and no DB plans; jumping to analysis")
+            return STATE_ANALYSIS
+        starting_capital = get_latest_capital(
+            default=cfg.get("initial_capital", 20000),
+            before_date=trade_date,
+        )
+        paper_trader = PaperTrader(initial_capital=starting_capital)
+        run_execution_phase(db_plans, paper_trader)
+        runtime["paper_trader"] = paper_trader
+        logger.info("[monitor] rebuilt paper_trader from DB (%d plans)", len(db_plans))
 
     # Hard exit check
     if sm.at_or_after(now, cfg.get("hard_exit_time", "15:15")):

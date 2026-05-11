@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from tradingagents.agents.schemas import ResearchPlan, render_research_plan
+
+logger = logging.getLogger(__name__)
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_intraday_context,
@@ -11,6 +15,14 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+
+
+_RM_FREETEXT_FORMAT = """---
+IMPORTANT — your response MUST use these exact section headers (the system parses them by name):
+
+**Recommendation**: Buy
+**Rationale**: (which debate arguments won and why)
+**Strategic Actions**: (entry zone, SL anchor, T1 anchor, position size %, time cutoff)"""
 
 
 def create_research_manager(llm):
@@ -55,13 +67,22 @@ The desk runs this analysis on N stocks each morning. After every name is rated,
 
 Speak in plain prose, as if briefing the Trader at the morning meeting."""
 
+        ticker = state.get("company_of_interest", "?")
+        logger.info("[RM] %s: invoking Research Manager", ticker)
+
         investment_plan = invoke_structured_or_freetext(
             structured_llm,
             llm,
             prompt,
             render_research_plan,
             "Research Manager",
+            freetext_suffix=_RM_FREETEXT_FORMAT,
         )
+
+        plan_preview = " | ".join(
+            line.strip() for line in investment_plan.splitlines()[:3] if line.strip()
+        )
+        logger.info("[RM] %s: plan → %s", ticker, plan_preview)
 
         new_investment_debate_state = {
             "judge_decision": investment_plan,

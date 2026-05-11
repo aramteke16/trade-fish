@@ -116,6 +116,18 @@ DEFAULT_CONFIG = {
         "news_data": "yfinance",
     },
     "tool_vendors": {},
+    # Dry run E2E testing
+    "dry_run_e2e": False,
+    "dry_run_ticker": "RELIANCE.NS",
+    "dry_run_plan": {
+        "entry_zone_low": 1400.0, "entry_zone_high": 1410.0,
+        "stop_loss": 1385.0, "target_1": 1440.0, "target_2": 1465.0,
+        "confidence_score": 7, "position_size_pct": 15.0,
+    },
+    "dry_run_price_sequence": [
+        1395.0, 1402.0, 1408.0, 1415.0,
+        1422.0, 1435.0, 1441.0, 1450.0,
+    ],
 }
 
 
@@ -242,4 +254,10 @@ CONFIG_METADATA = {
     "dispatcher_monitor_interval_sec": {"category": "dispatcher", "is_secret": False, "description": "Throttle monitor.tick() to run every N seconds (default 600 = 10 min)."},
     "precheck_time":                    {"category": "dispatcher", "is_secret": False, "description": "IST time to start precheck.", "input_type": "time"},
     "execution_time":                   {"category": "dispatcher", "is_secret": False, "description": "IST time to place orders.", "input_type": "time"},
+
+    # Dry run E2E testing
+    "dry_run_e2e":            {"category": "testing", "is_secret": False, "description": "Enable E2E dry run: agents run fully but execution uses scripted levels and prices."},
+    "dry_run_ticker":         {"category": "testing", "is_secret": False, "description": "Ticker to analyze in dry run (screener skipped)."},
+    "dry_run_plan":           {"category": "testing", "is_secret": False, "description": "Hardcoded trade levels used at execution time in dry run (overrides agent output). JSON object."},
+    "dry_run_price_sequence": {"category": "testing", "is_secret": False, "description": "Ordered price list fed to monitor ticks in dry run — cycles when exhausted. JSON array."},
 }

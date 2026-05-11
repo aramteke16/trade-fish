@@ -72,7 +72,17 @@ export default function Today() {
             {plans.map((p) => (
               <div key={p.id} style={{ border: '1px solid #1a1a1a', borderRadius: 2, padding: 12, fontSize: 12 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                  <span style={{ fontWeight: 600, fontSize: 13 }}>{p.ticker}</span>
+                  <span style={{ fontWeight: 600, fontSize: 13 }}>
+                    {p.ticker}
+                    {p.is_dry_run ? (
+                      <span style={{ fontSize: 9, background: '#2a2a00', color: '#e8c838', border: '1px solid #555', borderRadius: 2, padding: '1px 4px', marginLeft: 5, fontWeight: 400 }}>DRY RUN</span>
+                    ) : null}
+                    {!p.is_dry_run && p.price_adjusted_pct != null && Math.abs(p.price_adjusted_pct) > 0 && (
+                      <span style={{ fontSize: 10, color: p.price_adjusted_pct > 0 ? '#e8a838' : '#5b9cf6', marginLeft: 5, fontWeight: 400 }}>
+                        {p.price_adjusted_pct > 0 ? '↑' : '↓'}{Math.abs(p.price_adjusted_pct).toFixed(1)}% adj
+                      </span>
+                    )}
+                  </span>
                   <span style={{ fontWeight: 500, color: '#888' }}>{p.rating}</span>
                 </div>
                 <div style={{ color: '#555' }}>

@@ -190,6 +190,45 @@ export default function SettingsForm() {
         </div>
       ))}
 
+      {/* Dry Run E2E Testing toggle */}
+      {(() => {
+        const dryRunItem = allItems.find(i => i.key === 'dry_run_e2e')
+        const tickerItem = allItems.find(i => i.key === 'dry_run_ticker')
+        if (!dryRunItem) return null
+        const isOn = drafts.hasOwnProperty('dry_run_e2e') ? !!drafts['dry_run_e2e'] : !!dryRunItem.value
+        return (
+          <div style={{ border: '1px solid #2a2a00', borderRadius: 4, padding: 16, marginTop: 24, marginBottom: 8 }}>
+            <div style={{ color: '#e8c838', fontWeight: 600, fontSize: 13, marginBottom: 10 }}>Dry Run E2E Testing</div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer', marginBottom: 8 }}>
+              <input
+                type="checkbox"
+                checked={isOn}
+                onChange={async e => {
+                  setDraft('dry_run_e2e', e.target.checked)
+                  await patchConfig('dry_run_e2e', e.target.checked)
+                  setMsg(e.target.checked ? 'Dry run enabled — agents run fully, scripted prices used for monitoring.' : 'Dry run disabled.')
+                }}
+              />
+              <span style={{ fontSize: 12 }}>Enable dry run (agents run fully, execution uses hardcoded levels, monitor uses scripted prices)</span>
+            </label>
+            {isOn && tickerItem && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 4 }}>
+                <span style={{ fontSize: 11, color: '#888', minWidth: 80 }}>Dry run ticker</span>
+                <input
+                  style={{ background: '#111', border: '1px solid #333', color: '#ccc', padding: '3px 8px', borderRadius: 2, fontSize: 12, width: 140 }}
+                  value={drafts.hasOwnProperty('dry_run_ticker') ? drafts['dry_run_ticker'] : (tickerItem.value || '')}
+                  onChange={e => setDraft('dry_run_ticker', e.target.value)}
+                  onBlur={async e => {
+                    await patchConfig('dry_run_ticker', e.target.value)
+                    setMsg(`Dry run ticker set to ${e.target.value}`)
+                  }}
+                />
+              </div>
+            )}
+          </div>
+        )
+      })()}
+
       <div style={{ borderTop: '1px solid #1a1a1a', marginTop: 24, paddingTop: 20, display: 'flex', justifyContent: 'flex-end' }}>
         <button
           onClick={() => setResetCapitalOpen(true)}

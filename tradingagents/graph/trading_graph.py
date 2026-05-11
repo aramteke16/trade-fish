@@ -380,6 +380,13 @@ class TradingAgentsGraph:
         # Store current state for reflection.
         self.curr_state = final_state
 
+        # Log completion summary
+        decision = final_state.get("final_trade_decision", "")
+        decision_preview = " | ".join(
+            line.strip() for line in decision.splitlines()[:3] if line.strip()
+        )
+        logger.info("[graph] %s DONE → %s", company_name, decision_preview)
+
         # Log state to disk.
         self._log_state(trade_date, final_state)
 

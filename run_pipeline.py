@@ -33,6 +33,7 @@ from tradingagents.web.database import (
     insert_agent_report,
     insert_daily_metrics,
     get_latest_capital,
+    update_trade_plan_levels,
 )
 from tradingagents.default_config import DEFAULT_CONFIG  # noqa: F401  (fallback only)
 
@@ -219,24 +220,109 @@ def _save_to_db(ticker: str, date: str, final_state: dict, plan: dict, rating: s
 # Phase 3: Execution
 # ---------------------------------------------------------------------------
 
+_EXEC_PRICE_ADJUST_THRESHOLD_PCT = 1.0  # shift zone if live price > 1% from agent's zone mid
+
+
+def _get_live_price(ticker: str) -> Optional[float]:
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(ticker).history(period="1d", interval="1m")
+        return float(hist["Close"].iloc[-1]) if not hist.empty else None
+    except Exception as e:
+        logger.warning("[execution] %s: live price fetch failed: %s", ticker, e)
+        return None
+
+
+def _adjust_plan_to_live_price(plan: dict, live_price: float) -> float:
+    """Shift entry zone + SL + targets to center on live_price, preserving R:R.
+
+    Returns gap_pct (non-zero only when adjustment was made).
+    """
+    low = plan.get("entry_zone_low")
+    high = plan.get("entry_zone_high")
+    sl = plan.get("stop_loss")
+    t1 = plan.get("target_1")
+    if not all([low, high, sl, t1]):
+        return 0.0
+
+    zone_mid = (low + high) / 2.0
+    gap_pct = (live_price - zone_mid) / zone_mid * 100.0
+    if abs(gap_pct) <= _EXEC_PRICE_ADJUST_THRESHOLD_PCT:
+        return 0.0
+
+    half_width = (high - low) / 2.0
+    sl_dist = zone_mid - sl
+    t1_dist = t1 - zone_mid
+    t2 = plan.get("target_2") or t1 * 1.02
+    t2_dist = t2 - zone_mid
+
+    plan["entry_zone_low"]  = round(live_price - half_width, 2)
+    plan["entry_zone_high"] = round(live_price + half_width, 2)
+    plan["stop_loss"]       = round(live_price - sl_dist, 2)
+    plan["target_1"]        = round(live_price + t1_dist, 2)
+    plan["target_2"]        = round(live_price + t2_dist, 2)
+    return round(gap_pct, 2)
+
 
 def run_execution_phase(plans: List[dict], paper_trader: PaperTrader) -> List[str]:
     """Feed actionable trade plans into PaperTrader."""
     logger.info("=== Phase 3: Placing %d orders ===", len(plans))
+    cfg = _runtime_config()
+    dry_run = bool(cfg.get("dry_run_e2e", False))
+    dry_run_plan = cfg.get("dry_run_plan", {}) if dry_run else {}
     order_ids = []
 
     for plan in plans:
+        ticker = plan["ticker"]
+
+        if dry_run and plan.get("is_dry_run") and dry_run_plan:
+            # Override agent levels with hardcoded test levels
+            for k in ("entry_zone_low", "entry_zone_high", "stop_loss",
+                      "target_1", "target_2", "confidence_score", "position_size_pct"):
+                if k in dry_run_plan:
+                    plan[k] = dry_run_plan[k]
+            plan["rating"] = "Buy"  # ensure it gets placed
+            logger.info(
+                "[execution] DRY RUN: overriding %s levels → entry ₹%.1f-%.1f SL ₹%.1f T1 ₹%.1f",
+                ticker,
+                plan.get("entry_zone_low", 0), plan.get("entry_zone_high", 0),
+                plan.get("stop_loss", 0), plan.get("target_1", 0),
+            )
+            update_trade_plan_levels(plan, 0.0)
+        else:
+            # Fetch live price and shift zone if gapped from agent's prediction
+            live_price = _get_live_price(ticker)
+            if live_price:
+                gap_pct = _adjust_plan_to_live_price(plan, live_price)
+                if gap_pct != 0.0:
+                    logger.info(
+                        "[execution] %s: zone shifted to live ₹%.2f (gap %+.1f%%) "
+                        "→ entry ₹%.1f-%.1f SL ₹%.1f T1 ₹%.1f (R:R preserved)",
+                        ticker, live_price, gap_pct,
+                        plan["entry_zone_low"], plan["entry_zone_high"],
+                        plan["stop_loss"], plan["target_1"],
+                    )
+                    update_trade_plan_levels(plan, gap_pct)
+                else:
+                    logger.info(
+                        "[execution] %s: live ₹%.2f within zone ₹%.1f-%.1f — no adjustment needed",
+                        ticker, live_price,
+                        plan.get("entry_zone_low", 0), plan.get("entry_zone_high", 0),
+                    )
+            else:
+                logger.warning("[execution] %s: could not fetch live price — using agent zone as-is", ticker)
+
         oid = paper_trader.place_trade_plan(plan)
         if oid:
             order_ids.append(oid)
             logger.info(
                 "  Order %s: %s entry=%.2f-%.2f SL=%.2f T1=%.2f",
-                oid, plan["ticker"],
+                oid, ticker,
                 plan.get("entry_zone_low", 0), plan.get("entry_zone_high", 0),
                 plan.get("stop_loss", 0), plan.get("target_1", 0),
             )
         else:
-            logger.warning("  Order rejected for %s", plan["ticker"])
+            logger.warning("  Order rejected for %s", ticker)
 
     logger.info("Placed %d orders.", len(order_ids))
     return order_ids

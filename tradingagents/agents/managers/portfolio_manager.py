@@ -10,7 +10,11 @@ back gracefully to free-text generation.
 
 from __future__ import annotations
 
+import logging
+
 from tradingagents.agents.schemas import PortfolioDecision, render_pm_decision
+
+logger = logging.getLogger(__name__)
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_intraday_context,
@@ -20,6 +24,23 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+
+
+_PM_FREETEXT_FORMAT = """---
+IMPORTANT — your response MUST use these exact section headers (the system parses them by name):
+
+**Rating**: Buy
+**Executive Summary**: (2-4 sentences: entry, SL, T1, sizing, time cutoff, key risk)
+**Investment Thesis**: (evidence-anchored reasoning)
+**Entry Zone**: ₹{entry_low} - ₹{entry_high}
+**Stop Loss**: {sl_price}
+**Target 1**: {t1_price}
+**Target 2**: {t2_price}
+**Confidence**: {n}/10
+**Position Size %**: {n}%
+**Skip Rule**: (e.g. Skip if not in entry zone by 11:30 IST)
+
+If rating is Skip: include Rating, Executive Summary, Investment Thesis, Confidence — omit price levels."""
 
 
 def create_portfolio_manager(llm):
@@ -96,13 +117,23 @@ Spread your scores honestly across this range. **If everything you analyze comes
 
 Be decisive. The default is Buy with an honest confidence. Skip is only for outright unsafe situations.{get_language_instruction()}"""
 
+        ticker = state.get("company_of_interest", "?")
+        logger.info("[PM] %s: invoking Portfolio Manager", ticker)
+
         final_trade_decision = invoke_structured_or_freetext(
             structured_llm,
             llm,
             prompt,
             render_pm_decision,
             "Portfolio Manager",
+            freetext_suffix=_PM_FREETEXT_FORMAT,
         )
+
+        # Log the decision summary from the first two lines of the rendered output
+        decision_preview = " | ".join(
+            line.strip() for line in final_trade_decision.splitlines()[:4] if line.strip()
+        )
+        logger.info("[PM] %s: decision → %s", ticker, decision_preview)
 
         new_risk_debate_state = {
             "judge_decision": final_trade_decision,

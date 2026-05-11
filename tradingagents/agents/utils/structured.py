@@ -52,12 +52,28 @@ def bind_structured(llm: Any, schema: type[T], agent_name: str) -> Optional[Any]
         return None
 
 
+def _append_suffix(prompt: Any, suffix: str) -> Any:
+    """Append a format-instruction suffix to a prompt for the free-text path.
+
+    Handles the two common prompt shapes:
+    - str: appended directly with a blank line separator
+    - list of message dicts: a new user message is appended
+    - anything else (ChatPromptValue etc): returned untouched
+    """
+    if isinstance(prompt, str):
+        return prompt + "\n\n" + suffix
+    if isinstance(prompt, list):
+        return prompt + [{"role": "user", "content": suffix}]
+    return prompt
+
+
 def invoke_structured_or_freetext(
     structured_llm: Optional[Any],
     plain_llm: Any,
     prompt: Any,
     render: Callable[[T], str],
     agent_name: str,
+    freetext_suffix: Optional[str] = None,
 ) -> str:
     """Run the structured call and render to markdown; fall back to free-text on any failure.
 
@@ -65,6 +81,11 @@ def invoke_structured_or_freetext(
     invocations, a list of message dicts for chat models that take that
     shape). The same value is forwarded to the free-text path so the
     fallback sees the same input the structured call did.
+
+    ``freetext_suffix`` is appended to the prompt when taking the free-text
+    path. Use it to instruct thinking-mode models (Kimi K2, DeepSeek Reasoner)
+    to produce the exact markdown headers that the plan_extractor regexes
+    look for, so field extraction doesn't return all-null values.
     """
     if structured_llm is not None:
         try:
@@ -76,5 +97,6 @@ def invoke_structured_or_freetext(
                 agent_name, type(exc).__name__, exc,
             )
 
-    response = plain_llm.invoke(prompt)
+    effective_prompt = _append_suffix(prompt, freetext_suffix) if freetext_suffix else prompt
+    response = plain_llm.invoke(effective_prompt)
     return response.content

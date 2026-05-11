@@ -130,25 +130,26 @@ class DeepSeekChatOpenAI(NormalizedChatOpenAI):
 class MoonshotChatOpenAI(NormalizedChatOpenAI):
     """Moonshot/Kimi-specific overrides.
 
-    Kimi K2 models (K2.5, K2.6) have thinking always enabled, which makes
-    both ``tool_choice`` and ``json_schema`` response_format unreliable.
-    We raise ``NotImplementedError`` so agent factories fall back to
-    free-text generation cleanly at init time (no wasted 400 calls).
+    All kimi-k2* variants (K2, K2.5, K2.6, kimi-k2-thinking) have thinking
+    always enabled. Both structured-output methods fail with thinking on:
+      - function_calling: API rejects with "tool_choice incompatible with thinking"
+      - json_mode: model leaks intermediate thinking JSON and ignores JSON
+        constraints for certain outputs (e.g. SKIP responses)
+
+    We raise NotImplementedError for all kimi-k2* so bind_structured() routes
+    them to the free-text path, which uses a format suffix to guide the model
+    to produce the exact markdown headers the plan_extractor regexes look for.
 
     Non-thinking variants (moonshot-v1-*) work fine with the default path.
     """
 
-    _THINKING_MODELS = ("kimi-k2-thinking",)
+    _THINKING_MODELS = ("kimi-k2",)  # matches kimi-k2, kimi-k2.5, kimi-k2.6, kimi-k2-thinking
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
-        is_thinking = any(
-            self.model_name.startswith(m) for m in self._THINKING_MODELS
-        )
-        if is_thinking:
+        if any(self.model_name.startswith(m) for m in self._THINKING_MODELS):
             raise NotImplementedError(
-                f"{self.model_name} has thinking always enabled; "
-                "tool_choice and structured output are incompatible. "
-                "Agent factories fall back to free-text generation."
+                f"{self.model_name} has thinking always enabled; structured output "
+                "(tool_choice and json_mode) is incompatible. Using free-text generation."
             )
         return super().with_structured_output(schema, method=method, **kwargs)
 

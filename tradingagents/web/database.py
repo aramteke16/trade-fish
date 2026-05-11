@@ -71,6 +71,8 @@ def init_db():
         position_size_pct REAL,
         skip_rule TEXT,
         thesis TEXT,
+        price_adjusted_pct REAL DEFAULT 0,
+        is_dry_run INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -101,7 +103,8 @@ def init_db():
         pnl REAL,
         pnl_pct REAL,
         opened_at TEXT,
-        closed_at TEXT
+        closed_at TEXT,
+        is_dry_run INTEGER DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS daily_metrics (
@@ -199,12 +202,19 @@ def init_db():
     );
     """)
 
-    # Add exclude_from_feedback column to trade_plans if missing.
+    # Migrate trade_plans: add columns introduced after initial schema.
     # SQLite has no IF NOT EXISTS for ALTER TABLE, so check PRAGMA first.
     cols = {row[1] for row in conn.execute("PRAGMA table_info(trade_plans)").fetchall()}
     if "exclude_from_feedback" not in cols:
         conn.execute("ALTER TABLE trade_plans ADD COLUMN exclude_from_feedback INTEGER NOT NULL DEFAULT 0")
-        conn.commit()
+    if "price_adjusted_pct" not in cols:
+        conn.execute("ALTER TABLE trade_plans ADD COLUMN price_adjusted_pct REAL DEFAULT 0")
+    if "is_dry_run" not in cols:
+        conn.execute("ALTER TABLE trade_plans ADD COLUMN is_dry_run INTEGER DEFAULT 0")
+    pos_cols = {row[1] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
+    if "is_dry_run" not in pos_cols:
+        conn.execute("ALTER TABLE positions ADD COLUMN is_dry_run INTEGER DEFAULT 0")
+    conn.commit()
 
     # Seed app_config from DEFAULT_CONFIG. Idempotent — INSERT OR IGNORE
     # leaves any existing user edits alone and only fills in missing keys
@@ -251,14 +261,34 @@ def _seed_default_config_if_empty(conn: sqlite3.Connection) -> None:
         )
 
 
+def update_trade_plan_levels(plan: dict, price_adjusted_pct: float) -> None:
+    """Update entry zone, SL, and targets after live-price adjustment at execution time."""
+    conn = get_conn()
+    try:
+        conn.execute("""
+            UPDATE trade_plans
+            SET entry_zone_low=?, entry_zone_high=?, stop_loss=?, target_1=?, target_2=?,
+                price_adjusted_pct=?
+            WHERE ticker=? AND date=?
+        """, (
+            plan["entry_zone_low"], plan["entry_zone_high"],
+            plan["stop_loss"], plan["target_1"], plan.get("target_2"),
+            price_adjusted_pct,
+            plan["ticker"], plan.get("date", datetime.now().strftime("%Y-%m-%d")),
+        ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def insert_trade_plan(plan: dict):
     conn = get_conn()
     try:
         conn.execute("""
             INSERT INTO trade_plans
             (date, ticker, rating, entry_zone_low, entry_zone_high, stop_loss,
-             target_1, target_2, confidence_score, position_size_pct, skip_rule, thesis)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             target_1, target_2, confidence_score, position_size_pct, skip_rule, thesis, is_dry_run)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             plan.get("date", datetime.now().strftime("%Y-%m-%d")),
             plan.get("ticker"),
@@ -272,6 +302,7 @@ def insert_trade_plan(plan: dict):
             plan.get("position_size_pct"),
             plan.get("skip_rule"),
             plan.get("thesis"),
+            1 if plan.get("is_dry_run") else 0,
         ))
         conn.commit()
     finally:
@@ -305,8 +336,8 @@ def insert_position(position: dict):
         conn.execute("""
             INSERT INTO positions
             (date, ticker, quantity, entry_price, exit_price, stop_loss,
-             target_1, target_2, status, exit_reason, pnl, pnl_pct, opened_at, closed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             target_1, target_2, status, exit_reason, pnl, pnl_pct, opened_at, closed_at, is_dry_run)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             position.get("date", datetime.now().strftime("%Y-%m-%d")),
             position.get("ticker"),
@@ -322,6 +353,7 @@ def insert_position(position: dict):
             position.get("pnl_pct"),
             position.get("opened_at"),
             position.get("closed_at"),
+            1 if position.get("is_dry_run") else 0,
         ))
         conn.commit()
     finally:

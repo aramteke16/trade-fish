@@ -60,6 +60,9 @@ class MarketMonitor:
         self._last_news_actions: List[NewsAction] = []
         # Last cycle's per-ticker prices, exposed for mark-to-market display.
         self._last_prices: Dict[str, float] = {}
+        # Dry-run state
+        self._dry_run_price_idx: int = 0
+        self._is_dry_run: bool = False
 
     def run(self):
         """Block until execution window closes (15:15 IST), polling prices.
@@ -98,7 +101,8 @@ class MarketMonitor:
         method runs the hard-exit-all routine before returning True so
         callers don't need to hard-exit themselves.
         """
-        if not is_execution_window(now):
+        # In dry run, skip the execution-window gate so we can test outside market hours.
+        if not self._is_dry_run and not is_execution_window(now):
             logger.info(
                 "Execution window closed at %s. Running hard exit.",
                 now.strftime("%H:%M"),
@@ -132,7 +136,10 @@ class MarketMonitor:
         # to the constructor-time thresholds if the DB read fails.
         self._reload_config()
 
-        prices = self._fetch_current_prices(list(tickers))
+        if self._is_dry_run:
+            prices = self._fetch_dry_run_prices(list(tickers))
+        else:
+            prices = self._fetch_current_prices(list(tickers))
         valid_prices = {t: p for t, p in prices.items() if p is not None and p > 0}
         self._last_prices = valid_prices
 
@@ -212,6 +219,10 @@ class MarketMonitor:
             except (TypeError, ValueError):
                 pass
 
+        # Dry-run mode: use scripted price sequence, skip market-hours gate.
+        self._is_dry_run = bool(cfg.get("dry_run_e2e", False))
+        self._dry_run_price_sequence = cfg.get("dry_run_price_sequence", [1400.0])
+
     def _evaluate_news(
         self, now: datetime, valid_prices: Dict[str, float]
     ) -> List[NewsAction]:
@@ -268,6 +279,17 @@ class MarketMonitor:
             tickers.add(ticker)
         return tickers
 
+    def _fetch_dry_run_prices(self, tickers: List[str]) -> Dict[str, Optional[float]]:
+        """Return the next price from the scripted sequence for all tracked tickers."""
+        seq = getattr(self, "_dry_run_price_sequence", [1400.0])
+        price = seq[self._dry_run_price_idx % len(seq)]
+        logger.info(
+            "[monitor] DRY RUN: price tick #%d = ₹%.2f for %s",
+            self._dry_run_price_idx, price, tickers,
+        )
+        self._dry_run_price_idx += 1
+        return {t: price for t in tickers}
+
     def _fetch_current_prices(self, tickers: List[str]) -> Dict[str, Optional[float]]:
         """Fetch last traded price for tickers via yfinance fast_info."""
         prices: Dict[str, Optional[float]] = {}
@@ -320,6 +342,7 @@ class MarketMonitor:
                 "target_2": event.get("target_2"),
                 "status": "open",
                 "opened_at": now.isoformat(),
+                "is_dry_run": self._is_dry_run,
             })
         elif event_type in ("exit", "partial_exit"):
             pnl_str = f" P&L=Rs.{pnl:.2f}" if pnl is not None else ""

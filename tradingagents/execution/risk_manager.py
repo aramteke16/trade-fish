@@ -118,6 +118,9 @@ def apply_trailing_stops(
             unrealized_pct=round(unrealized_pct, 3),
         ))
 
-    if actions:
-        logger.info("Trailing-stop ladder applied: %d SL raises", len(actions))
+    for a in actions:
+        logger.info(
+            "[risk] %s SL ₹%.2f → ₹%.2f (%s, unrealized %+.2f%%)",
+            a.ticker, a.old_sl, a.new_sl, a.reason, a.unrealized_pct,
+        )
     return actions

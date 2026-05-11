@@ -252,6 +252,18 @@ def rank_and_allocate(
         )
     )
 
+    logger.info("[allocator] %s", summary)
+    for p in top:
+        rr = reward_to_risk(p)
+        logger.info(
+            "[allocator]   #%d %s conf=%s R:R=%.2f size=%.1f%% score=%.3f",
+            p["rank_position"], p["ticker"],
+            p.get("confidence_score", "?"),
+            rr if rr else 0.0,
+            p["position_size_pct"],
+            p["rank_score"],
+        )
+
     return AllocationResult(
         traded=top,
         saved_only=rest,

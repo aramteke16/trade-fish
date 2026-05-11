@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import functools
+
+logger = logging.getLogger(__name__)
 
 from langchain_core.messages import AIMessage
 
@@ -15,6 +18,23 @@ from tradingagents.agents.utils.structured import (
     bind_structured,
     invoke_structured_or_freetext,
 )
+
+
+_TRADER_FREETEXT_FORMAT = """---
+IMPORTANT — your response MUST use these exact section headers (the system parses them by name):
+
+**Action**: Buy
+**Reasoning**: (2-4 sentences)
+**Entry Zone**: ₹{entry_low} - ₹{entry_high}
+**Stop Loss**: {sl_price}
+**Target 1**: {t1_price}
+**Target 2**: {t2_price}
+**Confidence**: {n}/10
+**Skip Rule**: (time cutoff, e.g. Skip if not filled by 11:30 IST)
+
+FINAL TRANSACTION PROPOSAL: **BUY**  ← replace with **SKIP** if skipping
+
+If action is Skip: include Action, Reasoning, Confidence — omit price levels."""
 
 
 def create_trader(llm):
@@ -71,13 +91,21 @@ def create_trader(llm):
             },
         ]
 
+        logger.info("[Trader] %s: invoking Trader", company_name)
+
         trader_plan = invoke_structured_or_freetext(
             structured_llm,
             llm,
             messages,
             render_trader_proposal,
             "Trader",
+            freetext_suffix=_TRADER_FREETEXT_FORMAT,
         )
+
+        plan_preview = " | ".join(
+            line.strip() for line in trader_plan.splitlines()[:4] if line.strip()
+        )
+        logger.info("[Trader] %s: proposal → %s", company_name, plan_preview)
 
         return {
             "messages": [AIMessage(content=trader_plan)],
