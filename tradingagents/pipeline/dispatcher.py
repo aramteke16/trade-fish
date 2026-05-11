@@ -2,12 +2,16 @@
 
 Architecture: one ``BackgroundScheduler`` fires every 60 seconds. Each tick
 reads the current ``pipeline_state`` row from DB + the IST clock, dispatches
-to the matching state handler, and transitions if needed. No dynamic
-rescheduling — the 60s heartbeat is constant.
+to the matching state handler, and transitions if needed.
+
+Long-running handlers (precheck, waiting, analysis) are offloaded to a
+single background thread so the 60s tick stays non-blocking. While a
+background task runs, each tick updates ``state_since`` to keep the UI
+badge timestamp fresh and logs elapsed time for observability.
 
 State diagram:
 
-    idle ──[now >= 08:10]──► precheck ──[done]──► waiting
+    idle ──[now >= 08:10 AND not already ran today]──► precheck ──[done]──► waiting
     waiting ──[now >= 09:30]──► monitor
     monitor ──[now >= 15:15]──► analysis ──[done]──► idle
     holiday ──[next trading day]──► idle
@@ -20,7 +24,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import time as _time
 import traceback
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Optional
 
@@ -46,6 +52,13 @@ _runtime_lock = threading.Lock()
 DISPATCHER_JOB_ID = "dispatcher"
 
 TICK_INTERVAL_SEC = 60
+
+# Background executor for long-running handlers
+_bg_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pipeline-bg")
+_background_future: Optional[Future] = None
+_background_state: Optional[str] = None
+_background_started_at: Optional[float] = None
+_LONG_RUNNING_STATES = {STATE_PRECHECK, STATE_WAITING, STATE_ANALYSIS}
 
 
 def register_dispatcher(scheduler: BaseScheduler) -> None:
@@ -100,29 +113,112 @@ def get_active_paper_trader():
 
 
 # ---------------------------------------------------------------------------
+# Background task helpers
+# ---------------------------------------------------------------------------
+
+def _clear_background() -> None:
+    global _background_future, _background_state, _background_started_at
+    _background_future = None
+    _background_state = None
+    _background_started_at = None
+
+
+def _cancel_background() -> None:
+    """Cancel any in-flight background handler. Called by force-rerun API."""
+    global _background_future
+    if _background_future is not None and not _background_future.done():
+        _background_future.cancel()
+    _clear_background()
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher entry point
 # ---------------------------------------------------------------------------
 
 def dispatch_pipeline() -> None:
-    """Single tick. Reads state from DB, dispatches handler, transitions."""
+    """Single tick. Reads state from DB, dispatches handler, transitions.
+
+    Long-running states (precheck, waiting, analysis) are offloaded to a
+    background thread. Short states (idle, monitor, holiday) run inline.
+    """
+    global _background_future, _background_state, _background_started_at
+
     cfg = load_config()
     now = datetime.now(IST)
     state_row = sm.read_state()
     logger.info("dispatcher tick: state=%s, now=%s", state_row.state, now.strftime("%H:%M:%S"))
 
+    # Market-closed check
     if (
         sm.is_market_closed(now.date())
         and state_row.state not in (STATE_ANALYSIS, STATE_HOLIDAY)
     ):
         sm.transition_to(STATE_HOLIDAY, note=f"market closed on {now.date().isoformat()}")
+        _cancel_background()
         return
 
     handler = STATE_HANDLERS.get(state_row.state)
     if handler is None:
         logger.error("unknown state %r; resetting to idle", state_row.state)
         sm.transition_to(STATE_IDLE, note=f"recovered from unknown state {state_row.state!r}")
+        _cancel_background()
         return
 
+    # --- Background task handling for long-running states ---
+    if state_row.state in _LONG_RUNNING_STATES:
+        # Stale bg task from a different state (e.g. manual override) — cancel it
+        if _background_future is not None and _background_state != state_row.state:
+            logger.warning(
+                "[bg] stale task for %s while state is %s; cancelling",
+                _background_state, state_row.state,
+            )
+            _cancel_background()
+
+        if _background_future is not None:
+            if not _background_future.done():
+                elapsed = _time.time() - (_background_started_at or 0)
+                logger.info(
+                    "[bg] %s still running (%.0fs elapsed)",
+                    state_row.state, elapsed,
+                )
+                sm.touch_state_since()
+                return
+
+            # Task completed — harvest result
+            try:
+                next_state = _background_future.result()
+            except Exception:
+                tb = traceback.format_exc()
+                logger.exception("[bg] handler %s crashed", state_row.state)
+                sm.transition_to(
+                    STATE_IDLE, last_error=tb,
+                    note=f"handler {state_row.state!r} crashed (bg)",
+                )
+                _clear_background()
+                return
+
+            elapsed = _time.time() - (_background_started_at or 0)
+            logger.info(
+                "[bg] %s completed in %.1fs → next_state=%s",
+                state_row.state, elapsed, next_state,
+            )
+            _clear_background()
+
+            if next_state is not None and next_state != state_row.state:
+                sm.transition_to(next_state, trade_date=state_row.trade_date)
+            else:
+                sm.touch_state_since()
+            return
+
+        # No background task running — spawn one
+        _background_state = state_row.state
+        _background_started_at = _time.time()
+        _background_future = _bg_executor.submit(handler, now, state_row, cfg)
+        logger.info("[bg] spawned background task for %s", state_row.state)
+        sm.touch_state_since()
+        return
+
+    # --- Inline execution for short handlers (idle, monitor, holiday) ---
     try:
         next_state = handler(now, state_row, cfg)
     except Exception:
@@ -142,9 +238,12 @@ def dispatch_pipeline() -> None:
 # ---------------------------------------------------------------------------
 
 def handle_idle(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional[str]:
-    if sm.at_or_after(now, cfg.get("precheck_time", "08:10")):
-        return STATE_PRECHECK
-    return None
+    if not sm.at_or_after(now, cfg.get("precheck_time", "08:10")):
+        return None
+    today = now.strftime("%Y-%m-%d")
+    if sm.has_completed_today(today, "precheck"):
+        return None
+    return STATE_PRECHECK
 
 
 def handle_precheck(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional[str]:
@@ -235,7 +334,8 @@ def handle_monitor(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
         elapsed = monitor_interval  # force a tick on parse error
 
     if elapsed < monitor_interval:
-        return None  # skip this tick, don't update state_since
+        logger.debug("[monitor] throttled: %.0fs elapsed < %ds interval", elapsed, monitor_interval)
+        return None
 
     # Run the actual monitor tick
     monitor = runtime.get("monitor")

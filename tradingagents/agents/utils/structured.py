@@ -72,8 +72,8 @@ def invoke_structured_or_freetext(
             return render(result)
         except Exception as exc:
             logger.warning(
-                "%s: structured-output invocation failed (%s); retrying once as free text",
-                agent_name, exc,
+                "%s: structured-output failed (%s: %s); falling back to free text — extraction may return nulls",
+                agent_name, type(exc).__name__, exc,
             )
 
     response = plain_llm.invoke(prompt)

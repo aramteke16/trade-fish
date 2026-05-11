@@ -176,6 +176,10 @@ def _save_to_db(ticker: str, date: str, final_state: dict, plan: dict, rating: s
         logger.warning("Daily report save failed for %s: %s", ticker, e)
 
     # Save trade plan
+    _REQUIRED_FIELDS = ("entry_zone_low", "entry_zone_high", "stop_loss", "target_1", "confidence_score")
+    missing = [f for f in _REQUIRED_FIELDS if plan.get(f) is None]
+    if missing:
+        logger.warning("[save_to_db] %s plan missing %s — will show as incomplete in UI", ticker, missing)
     insert_trade_plan(plan)
 
     # Save agent reports

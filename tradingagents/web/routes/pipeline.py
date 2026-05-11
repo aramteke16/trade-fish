@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from tradingagents.dataflows.indian_market import IST
 from tradingagents.pipeline import dispatcher, state_machine as sm
 from tradingagents.web.config_service import load_config
+from tradingagents.web.database import get_conn
 
 logger = logging.getLogger(__name__)
 
@@ -110,4 +111,48 @@ def post_run_now(stage: str):
     return {
         "ran_stage": stage,
         "next_state": next_state or state_row.state,
+    }
+
+
+@router.post("/pipeline/force-rerun")
+def force_rerun():
+    """Clear today's analysis data and restart precheck from scratch.
+
+    Deletes trade_plans, agent_reports, debates, pipeline_state_history,
+    and markdown report files for today. Cancels any in-flight background
+    handler, then transitions to precheck.
+    """
+    import shutil
+    from pathlib import Path
+
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM trade_plans WHERE date = ?", (today,))
+        conn.execute("DELETE FROM agent_reports WHERE date = ?", (today,))
+        conn.execute("DELETE FROM debates WHERE date = ?", (today,))
+        conn.execute("DELETE FROM pipeline_state_history WHERE date(at) = ?", (today,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Remove markdown report files for today
+    try:
+        reports_dir = load_config().get("reports_dir", "")
+        if reports_dir:
+            day_dir = Path(reports_dir) / today
+            if day_dir.is_dir():
+                shutil.rmtree(day_dir)
+                logger.info("force-rerun: removed reports dir %s", day_dir)
+    except Exception as e:
+        logger.warning("force-rerun: could not remove reports: %s", e)
+
+    dispatcher._cancel_background()
+    new_row = sm.transition_to(sm.STATE_PRECHECK, note="force rerun via UI")
+    logger.info("force-rerun: cleared data for %s, transitioning to precheck", today)
+
+    return {
+        "status": "ok",
+        "cleared_date": today,
+        "state": new_row.state,
     }

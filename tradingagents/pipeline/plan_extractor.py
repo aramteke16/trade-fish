@@ -46,6 +46,13 @@ def extract_trade_plan(ticker: str, date: str, final_state: dict, rating: str) -
     plan["thesis"] = _extract_text(pm_text, r"\*\*Investment Thesis\*\*:\s*(.+?)(?:\n\n|\*\*|\Z)")
     plan["skip_rule"] = plan.get("skip_rule") or _extract_text(pm_text, r"\*\*Skip Rule\*\*:\s*(.+)")
 
+    _REQUIRED = ("entry_zone_low", "entry_zone_high", "stop_loss", "target_1", "confidence_score")
+    null_fields = [k for k in _REQUIRED if plan.get(k) is None]
+    if null_fields:
+        logger.warning("[plan_extractor] %s/%s: null fields %s — structured output likely failed", ticker, date, null_fields)
+    else:
+        logger.info("[plan_extractor] %s/%s: all fields extracted (conf=%s)", ticker, date, plan.get("confidence_score"))
+
     return plan
 
 

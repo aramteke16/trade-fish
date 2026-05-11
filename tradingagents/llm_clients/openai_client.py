@@ -138,7 +138,7 @@ class MoonshotChatOpenAI(NormalizedChatOpenAI):
     Non-thinking variants (moonshot-v1-*) work fine with the default path.
     """
 
-    _THINKING_MODELS = ("kimi-k2",)
+    _THINKING_MODELS = ("kimi-k2-thinking",)
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
         is_thinking = any(

@@ -69,10 +69,11 @@ export default function HistoryDate() {
                   <tr key={p.id}>
                     <td style={tdc}><span style={{ fontWeight: 500 }}>{p.ticker}</span></td>
                     <td style={tdc}>{p.rating}</td>
-                    <td style={tdc}>{p.confidence_score}/10</td>
-                    <td style={tdc}>{p.entry_zone_low?.toFixed(2)}–{p.entry_zone_high?.toFixed(2)}</td>
-                    <td style={tdc}>{p.stop_loss?.toFixed(2)}</td>
-                    <td style={tdc}>{p.target_1?.toFixed(2)}</td>
+                    <td style={tdc}>{p.confidence_score ?? '–'}/10</td>
+                    <td style={tdc}>{p.entry_zone_low != null && p.entry_zone_high != null
+                      ? `${p.entry_zone_low.toFixed(2)}–${p.entry_zone_high.toFixed(2)}` : '–'}</td>
+                    <td style={tdc}>{p.stop_loss != null ? p.stop_loss.toFixed(2) : '–'}</td>
+                    <td style={tdc}>{p.target_1 != null ? p.target_1.toFixed(2) : '–'}</td>
                     <td style={tdc}>{p.skip_rule || '--'}</td>
                   </tr>
                 ))}

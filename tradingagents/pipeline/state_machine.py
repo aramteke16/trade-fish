@@ -194,6 +194,21 @@ def touch_state_since() -> None:
     conn.close()
 
 
+def has_completed_today(trade_date: str, stage: str) -> bool:
+    """Check if a stage already ran today by looking at pipeline_state_history
+    for a transition FROM that stage on the given date."""
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM pipeline_state_history "
+            "WHERE from_state = ? AND date(at) = ? LIMIT 1",
+            (stage, trade_date),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def get_history(limit: int = 50) -> list[dict]:
     """Recent state transitions for the UI / debug view."""
     conn = get_conn()

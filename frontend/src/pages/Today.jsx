@@ -76,10 +76,11 @@ export default function Today() {
                   <span style={{ fontWeight: 500, color: '#888' }}>{p.rating}</span>
                 </div>
                 <div style={{ color: '#555' }}>
-                  Conf {p.confidence_score}/10 / entry {p.entry_zone_low?.toFixed(1)}-{p.entry_zone_high?.toFixed(1)}
+                  Conf {p.confidence_score ?? '–'}/10 / entry {p.entry_zone_low != null && p.entry_zone_high != null
+                    ? `${p.entry_zone_low.toFixed(1)}-${p.entry_zone_high.toFixed(1)}` : '–'}
                 </div>
                 <div style={{ color: '#555' }}>
-                  SL {p.stop_loss?.toFixed(1)} / T1 {p.target_1?.toFixed(1)}
+                  SL {p.stop_loss != null ? p.stop_loss.toFixed(1) : '–'} / T1 {p.target_1 != null ? p.target_1.toFixed(1) : '–'}
                 </div>
               </div>
             ))}

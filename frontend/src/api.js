@@ -60,6 +60,8 @@ export const transitionPipeline = (to, note) =>
   req('/pipeline/transition', { method: 'POST', body: JSON.stringify({ to, note }) })
 export const runStageNow = (stage) =>
   req(`/pipeline/run-now/${stage}`, { method: 'POST' })
+export const forceRerun = () =>
+  req('/pipeline/force-rerun', { method: 'POST' })
 
 // Admin
 export const resetCapital = (capital = null) =>
