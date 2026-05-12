@@ -357,6 +357,7 @@ def handle_monitor(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
         run_execution_phase(db_plans, paper_trader)
         runtime["paper_trader"] = paper_trader
         logger.info("[monitor] rebuilt paper_trader from DB (%d plans)", len(db_plans))
+        return None  # let the throttle govern the first tick; don't call monitor.tick() before window opens
 
     # Hard exit check
     if sm.at_or_after(now, cfg.get("hard_exit_time", "15:15")):
