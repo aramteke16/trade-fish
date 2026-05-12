@@ -105,16 +105,24 @@ def snapshot(
     daily_pnl: float,
 ) -> None:
     """Write the intraday capital buckets without touching start_capital
-    or is_finalized. Safe to call on every mutation event."""
+    or is_finalized. Safe to call on every mutation event.
+
+    Also rolls ``capital := start_capital + daily_pnl`` so the column always
+    reflects today's current value. Without this, a pipeline that crashed
+    or was restarted before ``finalize_day`` ran would leave yesterday's
+    ``capital`` stuck at ``start_capital`` and silently drop the realized
+    P&L from today's starting balance.
+    """
     conn = get_conn()
     try:
         conn.execute(
             """
             UPDATE daily_metrics
-            SET free_cash = ?, invested = ?, pending_reserved = ?, daily_pnl = ?
+            SET free_cash = ?, invested = ?, pending_reserved = ?, daily_pnl = ?,
+                capital = COALESCE(start_capital, capital) + ?
             WHERE date = ? AND is_finalized = 0
             """,
-            (free_cash, invested, pending_reserved, daily_pnl, date),
+            (free_cash, invested, pending_reserved, daily_pnl, daily_pnl, date),
         )
         conn.commit()
     finally:

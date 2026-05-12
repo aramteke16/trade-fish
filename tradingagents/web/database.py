@@ -576,19 +576,32 @@ def get_latest_capital(default: float, before_date: Optional[str] = None) -> flo
     that as today's starting capital. For historical dry-runs we pass
     ``before_date=date_being_simulated`` so today's own previous run (if any)
     doesn't double-count.
+
+    For non-finalized rows we prefer ``start_capital + daily_pnl`` over the
+    raw ``capital`` column. A pipeline that crashed before ``finalize_day``
+    ran would otherwise leave ``capital`` stuck at ``start_capital`` and
+    silently drop yesterday's P&L from today's starting balance.
     """
     conn = get_conn()
     try:
+        cols = "capital, start_capital, daily_pnl, is_finalized"
         if before_date:
             row = conn.execute(
-                "SELECT capital FROM daily_metrics WHERE date < ? ORDER BY date DESC LIMIT 1",
+                f"SELECT {cols} FROM daily_metrics WHERE date < ? "
+                f"ORDER BY date DESC LIMIT 1",
                 (before_date,),
             ).fetchone()
         else:
             row = conn.execute(
-                "SELECT capital FROM daily_metrics ORDER BY date DESC LIMIT 1"
+                f"SELECT {cols} FROM daily_metrics ORDER BY date DESC LIMIT 1"
             ).fetchone()
-        if row and row["capital"] is not None:
+        if row is None:
+            return float(default)
+        if row["is_finalized"] and row["capital"] is not None:
+            return float(row["capital"])
+        if row["start_capital"] is not None:
+            return float(row["start_capital"]) + float(row["daily_pnl"] or 0.0)
+        if row["capital"] is not None:
             return float(row["capital"])
         return float(default)
     finally:
