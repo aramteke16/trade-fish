@@ -63,6 +63,9 @@ class MarketMonitor:
         # Dry-run state
         self._dry_run_price_idx: int = 0
         self._is_dry_run: bool = False
+        # Execution window — overwritten by _reload_config() on each tick
+        self._execution_window_start: str = "09:15"
+        self._execution_window_end: str = "15:15"
 
     def run(self):
         """Block until execution window closes (15:15 IST), polling prices.
@@ -101,8 +104,13 @@ class MarketMonitor:
         method runs the hard-exit-all routine before returning True so
         callers don't need to hard-exit themselves.
         """
+        self._reload_config()  # pull execution_window_start/end and dry_run flag from DB
         # In dry run, skip the execution-window gate so we can test outside market hours.
-        if not self._is_dry_run and not is_execution_window(now):
+        if not self._is_dry_run and not is_execution_window(
+            now,
+            start=self._execution_window_start,
+            end=self._execution_window_end,
+        ):
             logger.info(
                 "Execution window closed at %s. Running hard exit.",
                 now.strftime("%H:%M"),
@@ -222,6 +230,10 @@ class MarketMonitor:
         # Dry-run mode: use scripted price sequence, skip market-hours gate.
         self._is_dry_run = bool(cfg.get("dry_run_e2e", False))
         self._dry_run_price_sequence = cfg.get("dry_run_price_sequence", [1400.0])
+
+        # Execution window from DB config — governs when tick() polls vs hard-exits.
+        self._execution_window_start = cfg.get("execution_window_start", "09:15")
+        self._execution_window_end = cfg.get("execution_window_end", "15:15")
 
     def _evaluate_news(
         self, now: datetime, valid_prices: Dict[str, float]

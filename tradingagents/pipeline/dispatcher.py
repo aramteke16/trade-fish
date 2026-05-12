@@ -367,6 +367,10 @@ def handle_monitor(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
         logger.info("[monitor] hard exit time reached; transitioning to analysis")
         return STATE_ANALYSIS
 
+    # Don't poll until the execution window is open (reads DB config — no hardcoding)
+    if not sm.at_or_after(now, cfg.get("execution_window_start", "10:30")):
+        return None
+
     # Throttle using a wall-clock timestamp — NOT state_since.
     # state_since is touched on every 60s tick to keep the UI badge fresh,
     # which would reset elapsed to ~60s every tick and prevent the poll firing.
