@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, List, Optional
 
+from tradingagents.dataflows.indian_market import IST
 from .database import get_conn
 
 
@@ -30,7 +31,7 @@ def insert_usage(
     use tools (e.g. PM final synthesis).
     """
     if not date:
-        date = datetime.now().strftime("%Y-%m-%d")
+        date = datetime.now(IST).strftime("%Y-%m-%d")
     conn = get_conn()
     try:
         conn.execute(

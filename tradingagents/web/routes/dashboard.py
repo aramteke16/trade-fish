@@ -2,11 +2,18 @@ from datetime import datetime
 from fastapi import APIRouter
 from typing import Optional
 
+from tradingagents.dataflows.indian_market import IST
 from ..database import get_trade_plans, get_positions, get_daily_metrics
 from ..config_service import load_config
 from .. import capital_service
 
 router = APIRouter()
+
+
+def _today_ist() -> str:
+    """IST-anchored YYYY-MM-DD so default-date endpoints always match the
+    trading day, never the server-local (often UTC) date."""
+    return datetime.now(IST).strftime("%Y-%m-%d")
 
 
 def _live_capital_state(date: str) -> dict:
@@ -149,14 +156,14 @@ def get_capital_log(date: Optional[str] = None, limit: int = 200):
     positions count at that moment.
     """
     if not date:
-        date = datetime.now().strftime("%Y-%m-%d")
+        date = _today_ist()
     return {"date": date, "rows": capital_service.get_log(date, limit=limit)}
 
 
 @router.get("/today")
 def get_today_dashboard(date: Optional[str] = None):
     if not date:
-        date = datetime.now().strftime("%Y-%m-%d")
+        date = _today_ist()
     plans = get_trade_plans(date)
     open_pos = get_positions(status="open")
     closed_today = [p for p in get_positions(status="closed") if p.get("date") == date]

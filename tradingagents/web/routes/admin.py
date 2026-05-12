@@ -17,6 +17,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from tradingagents.dataflows.indian_market import IST
 from ..config_service import load_config
 from ..database import insert_daily_metrics
 
@@ -44,7 +45,7 @@ def reset_capital(body: ResetCapitalRequest):
     amount = body.capital if body.capital is not None else float(cfg.get("initial_capital", 20000))
     if amount <= 0:
         raise HTTPException(status_code=400, detail="capital must be positive")
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(IST).strftime("%Y-%m-%d")
     insert_daily_metrics({
         "date": today,
         "capital": amount,

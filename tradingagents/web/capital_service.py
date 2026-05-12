@@ -35,9 +35,17 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+from tradingagents.dataflows.indian_market import IST
 from tradingagents.web.database import get_conn
 
 logger = logging.getLogger(__name__)
+
+
+def _today_ist() -> str:
+    """IST-anchored YYYY-MM-DD. The pipeline's trading day is always IST,
+    regardless of where the server runs (UTC containers would otherwise
+    flip the date 5h30m too early)."""
+    return datetime.now(IST).strftime("%Y-%m-%d")
 
 
 def init_day(date: str, start_capital: float) -> None:
@@ -157,7 +165,7 @@ def finalize_day(date: str) -> None:
 
 def get_today(date: Optional[str] = None) -> Optional[dict]:
     """Return today's row including the intraday capital buckets."""
-    date = date or datetime.now().strftime("%Y-%m-%d")
+    date = date or _today_ist()
     conn = get_conn()
     try:
         row = conn.execute(
@@ -207,7 +215,7 @@ def log_snapshot(
 def get_log(date: Optional[str] = None, limit: int = 200) -> list[dict]:
     """Return the most recent ``limit`` capital_log rows for ``date``,
     newest first."""
-    date = date or datetime.now().strftime("%Y-%m-%d")
+    date = date or _today_ist()
     conn = get_conn()
     try:
         rows = conn.execute(

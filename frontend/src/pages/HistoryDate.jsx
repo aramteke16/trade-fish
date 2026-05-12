@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { getDebates, getToday, getTokenStats, getDayFiles } from '../api'
+import { getDebates, getToday, getTokenStats, getDayFiles, todayIST } from '../api'
 import TokenUsagePanel from '../components/TokenUsagePanel'
 import DayFiles from '../components/DayFiles'
 
@@ -13,7 +13,7 @@ const label = { fontSize: 11, color: '#555', textTransform: 'uppercase', letterS
 const tdc = { padding: '6px 8px', borderBottom: '1px solid #111', fontSize: 12, fontVariantNumeric: 'tabular-nums' }
 
 export default function HistoryDate() {
-  const [date, setDate] = useState(new Date().toISOString().slice(0, 10))
+  const [date, setDate] = useState(todayIST())
   const [today, setToday] = useState(null)
   const [debates, setDebates] = useState([])
   const [tokens, setTokens] = useState([])

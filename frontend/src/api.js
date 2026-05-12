@@ -14,6 +14,14 @@ async function req(path, opts = {}) {
   return r.json()
 }
 
+// IST-anchored YYYY-MM-DD. Using toISOString() returns UTC, which flips the
+// date 5h30m too early for IST users and leaves the UI showing yesterday's
+// data after midnight IST until 05:30 UTC. en-CA with timeZone Asia/Kolkata
+// gives us YYYY-MM-DD in IST regardless of the browser's local timezone.
+export function todayIST() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+}
+
 // Dashboard / global
 export const getToday = (date) =>
   req(`/today${date ? `?date=${date}` : ''}`)

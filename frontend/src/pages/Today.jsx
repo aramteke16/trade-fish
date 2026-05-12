@@ -1,6 +1,6 @@
-import React from 'react'
+import React, { useEffect, useState } from 'react'
 import usePolling from '../hooks/usePolling'
-import { getToday, getTokenStats, getDayFiles, fmtINR } from '../api'
+import { getToday, getTokenStats, getDayFiles, fmtINR, todayIST } from '../api'
 import PipelineStateBadge from '../components/PipelineStateBadge'
 import LiveDebateStream from '../components/LiveDebateStream'
 import PositionTableLive from '../components/PositionTableLive'
@@ -16,13 +16,21 @@ const section = {
 }
 const label = { fontSize: 11, color: '#555', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 12 }
 
-const today = () => new Date().toISOString().slice(0, 10)
-
 export default function Today() {
-  const dateStr = today()
-  const todayQ = usePolling(() => getToday(dateStr), 5000)
-  const tokensQ = usePolling(() => getTokenStats(dateStr), 10000)
-  const filesQ = usePolling(() => getDayFiles(dateStr), 15000)
+  // Roll the date over automatically when IST midnight passes while the
+  // tab stays open. Without this, a tab opened at 23:55 IST would keep
+  // querying yesterday's date forever.
+  const [dateStr, setDateStr] = useState(todayIST())
+  useEffect(() => {
+    const id = setInterval(() => {
+      const t = todayIST()
+      setDateStr((prev) => (prev === t ? prev : t))
+    }, 30_000)
+    return () => clearInterval(id)
+  }, [])
+  const todayQ = usePolling(() => getToday(dateStr), 5000, [dateStr])
+  const tokensQ = usePolling(() => getTokenStats(dateStr), 10000, [dateStr])
+  const filesQ = usePolling(() => getDayFiles(dateStr), 15000, [dateStr])
 
   const data = todayQ.data
   const tokens = tokensQ.data

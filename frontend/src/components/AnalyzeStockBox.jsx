@@ -1,5 +1,5 @@
 import React, { useState, useReducer, useEffect, useRef } from 'react'
-import { startAnalyze, getAnalysis, getAnalysisReport } from '../api'
+import { startAnalyze, getAnalysis, getAnalysisReport, todayIST } from '../api'
 import useWebSocket from '../hooks/useWebSocket'
 
 function agentReducer(state, msg) {
@@ -42,13 +42,9 @@ function agentReducer(state, msg) {
   }
 }
 
-function todayISO() {
-  return new Date().toISOString().slice(0, 10)
-}
-
 export default function AnalyzeStockBox({ onSubmitted }) {
   const [ticker, setTicker] = useState('')
-  const [date, setDate] = useState(todayISO())
+  const [date, setDate] = useState(todayIST())
   const [running, setRunning] = useState(null)
   const [activeTicker, setActiveTicker] = useState(null)
   const [agents, dispatch] = useReducer(agentReducer, {})

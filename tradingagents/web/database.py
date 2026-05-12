@@ -8,6 +8,16 @@ from pathlib import Path
 from typing import List, Dict, Optional, Any
 
 
+def _today_ist() -> str:
+    """IST-anchored YYYY-MM-DD. Used as the default for ``date`` columns so
+    rows are stamped with the trading day, not the (often UTC) server date."""
+    # Local import keeps the module load order resilient — indian_market only
+    # depends on stdlib + pytz, but importing at the module top would still
+    # pull a side-effect-free module before the DB file is opened by callers.
+    from tradingagents.dataflows.indian_market import IST
+    return datetime.now(IST).strftime("%Y-%m-%d")
+
+
 def _resolve_db_path() -> Path:
     """Pick the SQLite file location with env-var override.
 
@@ -309,7 +319,7 @@ def update_trade_plan_levels(plan: dict, price_adjusted_pct: float) -> None:
             plan["entry_zone_low"], plan["entry_zone_high"],
             plan["stop_loss"], plan["target_1"], plan.get("target_2"),
             price_adjusted_pct,
-            plan["ticker"], plan.get("date", datetime.now().strftime("%Y-%m-%d")),
+            plan["ticker"], plan.get("date", _today_ist()),
         ))
         conn.commit()
     finally:
@@ -325,7 +335,7 @@ def insert_trade_plan(plan: dict):
              target_1, target_2, confidence_score, position_size_pct, skip_rule, thesis, is_dry_run)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            plan.get("date", datetime.now().strftime("%Y-%m-%d")),
+            plan.get("date", _today_ist()),
             plan.get("ticker"),
             plan.get("rating"),
             plan.get("entry_zone_low"),
@@ -352,7 +362,7 @@ def insert_debate(debate: dict):
             (date, ticker, round_num, bull_argument, bear_argument, verdict, confidence)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
-            debate.get("date", datetime.now().strftime("%Y-%m-%d")),
+            debate.get("date", _today_ist()),
             debate.get("ticker"),
             debate.get("round_num", 1),
             debate.get("bull_argument"),
@@ -374,7 +384,7 @@ def insert_position(position: dict):
              target_1, target_2, status, exit_reason, pnl, pnl_pct, opened_at, closed_at, is_dry_run)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            position.get("date", datetime.now().strftime("%Y-%m-%d")),
+            position.get("date", _today_ist()),
             position.get("ticker"),
             position.get("quantity"),
             position.get("entry_price"),
@@ -447,7 +457,7 @@ def insert_daily_metrics(metrics: dict):
     """
     conn = get_conn()
     try:
-        date = metrics.get("date", datetime.now().strftime("%Y-%m-%d"))
+        date = metrics.get("date", _today_ist())
         existing = conn.execute(
             "SELECT id FROM daily_metrics WHERE date = ?", (date,)
         ).fetchone()
@@ -495,7 +505,7 @@ def insert_agent_report(report: dict):
             (date, ticker, agent_type, report)
             VALUES (?, ?, ?, ?)
         """, (
-            report.get("date", datetime.now().strftime("%Y-%m-%d")),
+            report.get("date", _today_ist()),
             report.get("ticker"),
             report.get("agent_type"),
             report.get("report"),
