@@ -90,6 +90,22 @@ def run_screener(top_n: int = 5) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _build_capital_context(capital: float, cfg: dict, num_stocks: int) -> str:
+    deploy_pct = cfg.get("deploy_pct_top_k", 70.0)
+    max_per_stock = cfg.get("max_capital_per_stock_pct", 25.0)
+    max_loss_pct = cfg.get("max_loss_per_trade_pct", 1.5)
+    deployable = capital * (deploy_pct / 100)
+    per_stock_budget = capital * (max_per_stock / 100)
+    max_loss_inr = capital * (max_loss_pct / 100)
+    return (
+        f"Available capital: ₹{capital:,.0f}. "
+        f"Deployable today: ₹{deployable:,.0f} ({deploy_pct:.0f}% of total). "
+        f"Max per stock: ₹{per_stock_budget:,.0f} ({max_per_stock:.0f}%). "
+        f"Max loss per trade: ₹{max_loss_inr:,.0f} ({max_loss_pct}%). "
+        f"Analyzing {num_stocks} stocks — allocator picks top selections by confidence × R:R."
+    )
+
+
 def run_analysis_phase(
     top_stocks: List[dict],
     config: Optional[dict] = None,
@@ -111,13 +127,19 @@ def run_analysis_phase(
     date = date or datetime.now(IST).strftime("%Y-%m-%d")
     cfg = config or _runtime_config()
 
+    starting_capital = get_latest_capital(
+        default=cfg.get("initial_capital", 20000),
+        before_date=date,
+    )
+    capital_context = _build_capital_context(starting_capital, cfg, n)
+
     all_plans: List[dict] = []
     completed = 0
 
     def analyze_one(stock: dict):
         ticker = stock["ticker"]
         graph = TradingAgentsGraph(debug=False, config=cfg)
-        final_state, rating = graph.propagate(ticker, date)
+        final_state, rating = graph.propagate(ticker, date, available_capital=capital_context)
         plan = extract_trade_plan(ticker, date, final_state, rating)
         _save_to_db(ticker, date, final_state, plan, rating)
         return ticker, plan, rating
@@ -234,16 +256,40 @@ def _get_live_price(ticker: str) -> Optional[float]:
 
 
 def _adjust_plan_to_live_price(plan: dict, live_price: float) -> float:
-    """Shift entry zone + SL + targets to center on live_price, preserving R:R.
+    """Shift entry levels + SL + targets so the order anchors on live_price,
+    preserving R:R.
 
     Returns gap_pct (non-zero only when adjustment was made).
+
+    When ``use_upper_band_only`` is enabled the upper band is the anchor (the
+    order behaves like a buy-limit at ``entry_zone_high``). Otherwise the
+    legacy zone-midpoint anchor is used.
     """
-    low = plan.get("entry_zone_low")
     high = plan.get("entry_zone_high")
     sl = plan.get("stop_loss")
     t1 = plan.get("target_1")
-    if not all([low, high, sl, t1]):
+    if not all([high, sl, t1]):
         return 0.0
+
+    upper_band_only = bool(_runtime_config().get("use_upper_band_only", True))
+    low = plan.get("entry_zone_low")
+    t2 = plan.get("target_2") or t1 * 1.02
+
+    if upper_band_only or low is None:
+        anchor = high
+        gap_pct = (live_price - anchor) / anchor * 100.0
+        if abs(gap_pct) <= _EXEC_PRICE_ADJUST_THRESHOLD_PCT:
+            return 0.0
+        delta = live_price - anchor
+        plan["entry_zone_high"] = round(live_price, 2)
+        if low is not None:
+            plan["entry_zone_low"] = round(low + delta, 2)
+        else:
+            plan["entry_zone_low"] = round(live_price, 2)
+        plan["stop_loss"] = round(sl + delta, 2)
+        plan["target_1"] = round(t1 + delta, 2)
+        plan["target_2"] = round(t2 + delta, 2)
+        return round(gap_pct, 2)
 
     zone_mid = (low + high) / 2.0
     gap_pct = (live_price - zone_mid) / zone_mid * 100.0
@@ -253,7 +299,6 @@ def _adjust_plan_to_live_price(plan: dict, live_price: float) -> float:
     half_width = (high - low) / 2.0
     sl_dist = zone_mid - sl
     t1_dist = t1 - zone_mid
-    t2 = plan.get("target_2") or t1 * 1.02
     t2_dist = t2 - zone_mid
 
     plan["entry_zone_low"]  = round(live_price - half_width, 2)

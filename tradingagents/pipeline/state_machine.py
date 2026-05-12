@@ -56,6 +56,7 @@ class StateRow:
 
     state: str
     state_since: str
+    last_heartbeat_at: Optional[str]
     trade_date: Optional[str]
     next_run_at: Optional[str]
     last_error: Optional[str]
@@ -76,15 +77,15 @@ def read_state() -> StateRow:
     """
     conn = get_conn()
     row = conn.execute(
-        "SELECT state, state_since, trade_date, next_run_at, last_error, payload "
+        "SELECT state, state_since, last_heartbeat_at, trade_date, next_run_at, last_error, payload "
         "FROM pipeline_state WHERE id = 1"
     ).fetchone()
     if row is None:
         # Self-heal: re-insert the seed row.
         conn.execute(
-            "INSERT OR REPLACE INTO pipeline_state (id, state, state_since) "
-            "VALUES (1, ?, ?)",
-            (STATE_IDLE, datetime.now(IST).isoformat()),
+            "INSERT OR REPLACE INTO pipeline_state (id, state, state_since, last_heartbeat_at) "
+            "VALUES (1, ?, ?, ?)",
+            (STATE_IDLE, datetime.now(IST).isoformat(), datetime.now(IST).isoformat()),
         )
         conn.commit()
         conn.close()
@@ -92,6 +93,7 @@ def read_state() -> StateRow:
         return StateRow(
             state=STATE_IDLE,
             state_since=datetime.now(IST).isoformat(),
+            last_heartbeat_at=datetime.now(IST).isoformat(),
             trade_date=None,
             next_run_at=None,
             last_error=None,
@@ -107,6 +109,7 @@ def read_state() -> StateRow:
     return StateRow(
         state=row["state"],
         state_since=row["state_since"],
+        last_heartbeat_at=row["last_heartbeat_at"] or row["state_since"],
         trade_date=row["trade_date"],
         next_run_at=row["next_run_at"],
         last_error=row["last_error"],
@@ -156,10 +159,10 @@ def transition_to(
         now_ist = datetime.now(IST).isoformat()
         conn.execute(
             "UPDATE pipeline_state SET "
-            "state = ?, state_since = ?, "
+            "state = ?, state_since = ?, last_heartbeat_at = ?, "
             "trade_date = ?, next_run_at = ?, last_error = ?, payload = ? "
             "WHERE id = 1",
-            (new_state, now_ist, trade_date, next_run_iso, last_error, payload_json),
+            (new_state, now_ist, now_ist, trade_date, next_run_iso, last_error, payload_json),
         )
         if from_state != new_state:
             conn.execute(
@@ -182,16 +185,24 @@ def transition_to(
     return read_state()
 
 
-def touch_state_since() -> None:
-    """Update only state_since without writing to history. Used by the
-    dispatcher on no-op ticks to keep the UI badge time fresh."""
+def touch_heartbeat() -> None:
+    """Update the liveness timestamp without changing state entry time."""
     conn = get_conn()
     conn.execute(
-        "UPDATE pipeline_state SET state_since = ? WHERE id = 1",
+        "UPDATE pipeline_state SET last_heartbeat_at = ? WHERE id = 1",
         (datetime.now(IST).isoformat(),),
     )
     conn.commit()
     conn.close()
+
+
+def touch_state_since() -> None:
+    """Backward-compatible alias for older callers.
+
+    ``state_since`` now means "when the state was entered"; heartbeat updates
+    live in ``last_heartbeat_at``.
+    """
+    touch_heartbeat()
 
 
 def has_completed_today(trade_date: str, stage: str) -> bool:

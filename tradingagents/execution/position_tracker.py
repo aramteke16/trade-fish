@@ -42,6 +42,11 @@ class PositionTracker:
         self.daily_loss = 0.0
 
     def add_position(self, position: Position, capital_used: float):
+        if capital_used > self.capital:
+            logger.warning(
+                "add_position %s: capital_used ₹%.2f > available ₹%.2f — capital will go negative",
+                position.ticker, capital_used, self.capital,
+            )
         self.capital -= capital_used
         self.open_positions[position.ticker] = position
         logger.info("Opened position %s qty=%d @ %.2f", position.ticker, position.quantity, position.entry_price)

@@ -84,6 +84,9 @@ DEFAULT_CONFIG = {
     "top_k_positions": 3,
     "deploy_pct_top_k": 70.0,
     "target_daily_return_pct": 1.0,
+    # Order placement
+    "use_upper_band_only": True,
+    "min_capital_to_trade": 5000,
     # Live monitor (Phase 4) — trailing-stop ladder
     "poll_interval_sec": 600,
     "breakeven_trigger_pct": 0.5,
@@ -224,6 +227,18 @@ CONFIG_METADATA = {
     # Allocator
     "top_k_positions":   {"category": "allocator", "is_secret": False, "description": "How many top-scored stocks to actually trade each day."},
     "deploy_pct_top_k":  {"category": "allocator", "is_secret": False, "description": "Total capital % deployed across top-K (half-Kelly cap)."},
+
+    # Order placement
+    "use_upper_band_only": {
+        "category": "execution",
+        "is_secret": False,
+        "description": "When True, only the entry zone upper band is used at placement time: validation does not require entry_zone_low, and live-price adjustment anchors on the upper band (treated as a buy-limit at entry_zone_high).",
+    },
+    "min_capital_to_trade": {
+        "category": "execution",
+        "is_secret": False,
+        "description": "Minimum free cash (INR) required to place any new order. If today's available capital falls below this, the placement phase is skipped entirely for the day.",
+    },
 
     # Live-monitor knobs
     "poll_interval_sec":     {"category": "monitor", "is_secret": False, "description": "Seconds between price polls during execution window."},

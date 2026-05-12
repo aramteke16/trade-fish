@@ -111,8 +111,16 @@ def _run_full_pipeline(analysis_id: int, ticker: str, trade_date: str = "") -> N
         # base, then rename the inner ticker dir to TICKER_HHMM.
         base_reports = Path(cfg.get("reports_dir") or "~/.tradingagents/reports").expanduser()
         on_demand_root = base_reports / "on_demand"
+
+        from tradingagents.web.database import get_latest_capital
+        from run_pipeline import _build_capital_context
+        starting_capital = get_latest_capital(
+            default=cfg.get("initial_capital", 20000), before_date=date,
+        )
+        capital_context = _build_capital_context(starting_capital, cfg, 1)
+
         graph = TradingAgentsGraph(debug=False, config=cfg)
-        final_state, rating = graph.propagate(ticker, date)
+        final_state, rating = graph.propagate(ticker, date, available_capital=capital_context)
 
         # Write under on_demand/<DATE>/<TICKER>/ first (using the helper),
         # then rename to TICKER_HHMM so multiple runs the same day coexist.

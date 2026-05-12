@@ -6,6 +6,7 @@ import LiveDebateStream from '../components/LiveDebateStream'
 import PositionTableLive from '../components/PositionTableLive'
 import TokenUsagePanel from '../components/TokenUsagePanel'
 import DayFiles from '../components/DayFiles'
+import CapitalLogTable from '../components/CapitalLogTable'
 
 const section = {
   marginBottom: 16,
@@ -36,28 +37,37 @@ export default function Today() {
         <PipelineStateBadge />
       </div>
 
-      {data?.portfolio && (
-        <div style={{ display: 'flex', gap: 1, flexWrap: 'wrap', marginBottom: 16 }}>
-          {[
-            { label: 'Capital', value: fmtINR(data.portfolio.initial_capital) },
-            { label: 'Invested', value: fmtINR(data.portfolio.invested) },
-            { label: 'Free Cash', value: fmtINR(data.portfolio.free_cash) },
-            { label: 'Realized P&L', value: fmtINR(data.portfolio.realized_pnl), negative: (data.portfolio.realized_pnl || 0) < 0 },
-          ].map((c) => (
-            <div key={c.label} style={{
-              flex: 1, minWidth: 140, padding: '12px 16px',
-              border: '1px solid #1a1a1a', borderRadius: 2,
-            }}>
-              <div style={{ fontSize: 11, color: '#666', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{c.label}</div>
-              <div style={{
-                fontSize: 20, fontWeight: 600, marginTop: 4,
-                fontVariantNumeric: 'tabular-nums',
-                color: c.negative ? '#888' : '#e5e5e5',
-              }}>{c.value}</div>
-            </div>
-          ))}
-        </div>
-      )}
+      {data?.portfolio && (() => {
+        const p = data.portfolio
+        const realized = p.realized_pnl || 0
+        const pendingShown = (p.pending_reserved || 0) > 0
+        const tiles = [
+          { label: 'Invested Amount', value: fmtINR(p.seed_capital), sub: 'lifetime seed' },
+          { label: 'Current Value', value: fmtINR(p.current_value), sub: `start ${fmtINR(p.start_capital)} ${realized >= 0 ? '+' : '−'} ${fmtINR(Math.abs(realized))}` },
+          { label: 'Free Cash', value: fmtINR(p.free_cash), sub: pendingShown ? `pending ${fmtINR(p.pending_reserved)} · invested ${fmtINR(p.invested)}` : `invested ${fmtINR(p.invested)}` },
+          { label: 'Realized P&L', value: fmtINR(realized), negative: realized < 0, sub: p.is_finalized ? 'day closed' : 'live' },
+        ]
+        return (
+          <div style={{ display: 'flex', gap: 1, flexWrap: 'wrap', marginBottom: 16 }}>
+            {tiles.map((c) => (
+              <div key={c.label} style={{
+                flex: 1, minWidth: 160, padding: '12px 16px',
+                border: '1px solid #1a1a1a', borderRadius: 2,
+              }}>
+                <div style={{ fontSize: 11, color: '#666', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{c.label}</div>
+                <div style={{
+                  fontSize: 20, fontWeight: 600, marginTop: 4,
+                  fontVariantNumeric: 'tabular-nums',
+                  color: c.negative ? '#c66' : '#e5e5e5',
+                }}>{c.value}</div>
+                {c.sub && (
+                  <div style={{ fontSize: 10, color: '#555', marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>{c.sub}</div>
+                )}
+              </div>
+            ))}
+          </div>
+        )
+      })()}
 
       <div style={section}>
         <LiveDebateStream />
@@ -101,6 +111,11 @@ export default function Today() {
       <div style={section}>
         <div style={label}>Open positions</div>
         <PositionTableLive open={open} plansById={plansByTicker} onChange={() => todayQ.refresh()} />
+      </div>
+
+      <div style={section}>
+        <div style={label}>Capital log (per monitor check)</div>
+        <CapitalLogTable date={dateStr} />
       </div>
 
       <div style={section}>

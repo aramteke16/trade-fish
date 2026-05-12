@@ -49,6 +49,7 @@ def create_portfolio_manager(llm):
     def portfolio_manager_node(state) -> dict:
         instrument_context = build_instrument_context(state["company_of_interest"])
         intraday_context = get_intraday_context()
+        capital_context = state.get("available_capital", "")
 
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
@@ -63,11 +64,13 @@ def create_portfolio_manager(llm):
             else ""
         )
 
+        capital_line = f"\n\n**Capital context:**\n{capital_context}\n" if capital_context else ""
+
         prompt = f"""You are the Portfolio Manager, the final decision-maker on the trading desk. Your job is to synthesize the risk-analyst debate and **rate this stock's intraday quality** so the desk can rank it against today's other candidates.
 
 {instrument_context}
 
-{intraday_context}
+{intraday_context}{capital_line}
 
 ---
 

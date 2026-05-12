@@ -34,6 +34,64 @@ class PaperTrader:
         self.trading_paused = False
         self.pause_reason = ""
 
+    def _pending_reserved_capital(self) -> float:
+        """Sum of capital tied up by pending (unfilled) orders.
+
+        Uses ``entry_zone_high`` as the conservative reservation per order
+        (the buy-limit price). On fill, the actual capital deducted from
+        free_cash may be lower; the difference is implicitly released because
+        this method recounts pending orders fresh on each call.
+        """
+        from .order_manager import OrderStatus
+        return sum(
+            (o.entry_zone_high or 0.0) * (o.quantity or 0)
+            for o in self.order_manager.orders.values()
+            if o.status == OrderStatus.PENDING
+        )
+
+    def get_capital_state(self, current_prices: Optional[Dict[str, float]] = None) -> dict:
+        """Live capital snapshot.
+
+        Returns the buckets the project's capital model exposes to the UI:
+        seed_capital (lifetime constant), start_capital (today's start),
+        current_value (start + realized_pnl), free_cash (available for new
+        orders, net of pending reservations), invested (in filled positions),
+        pending_reserved, and realized_pnl.
+
+        When ``current_prices`` is provided, also returns ``unrealized_pnl``
+        (mark-to-market on open positions) and ``mtm_value`` (current_value +
+        unrealized_pnl). Without prices, unrealized fields are 0.
+        """
+        invested = sum(
+            (p.entry_price or 0.0) * (p.quantity or 0)
+            for p in self.position_tracker.open_positions.values()
+        )
+        pending = self._pending_reserved_capital()
+        start_capital = float(self.position_tracker.initial_capital)
+        realized = float(self.position_tracker.daily_pnl)
+        current_value = start_capital + realized
+        free_cash = max(0.0, float(self.position_tracker.capital) - pending)
+
+        unrealized = 0.0
+        if current_prices:
+            for ticker, pos in self.position_tracker.open_positions.items():
+                price = current_prices.get(ticker)
+                if price and price > 0:
+                    unrealized += (price - (pos.entry_price or 0.0)) * (pos.quantity or 0)
+        mtm_value = current_value + unrealized
+
+        return {
+            "start_capital": round(start_capital, 2),
+            "current_value": round(current_value, 2),
+            "free_cash": round(free_cash, 2),
+            "invested": round(invested, 2),
+            "pending_reserved": round(pending, 2),
+            "realized_pnl": round(realized, 2),
+            "unrealized_pnl": round(unrealized, 2),
+            "mtm_value": round(mtm_value, 2),
+            "open_positions_count": len(self.position_tracker.open_positions),
+        }
+
     def place_trade_plan(self, plan: dict) -> Optional[str]:
         """Place a trade plan from the portfolio manager."""
         if self.trading_paused:
@@ -41,6 +99,17 @@ class PaperTrader:
             return None
 
         ticker = plan["ticker"]
+
+        # Prevent duplicate orders for the same ticker
+        for o in self.order_manager.orders.values():
+            if o.ticker == ticker and o.status in (OrderStatus.PENDING, OrderStatus.FILLED):
+                logger.warning("Order for %s already exists (status=%s); skipping duplicate", ticker, o.status.value)
+                return None
+
+        # Prevent ordering a ticker we already hold
+        if ticker in self.position_tracker.open_positions:
+            logger.warning("Already have open position for %s; skipping", ticker)
+            return None
         entry_low = plan.get("entry_zone_low")
         entry_high = plan.get("entry_zone_high")
         stop_loss = plan.get("stop_loss")
@@ -48,15 +117,30 @@ class PaperTrader:
         target_2 = plan.get("target_2")
         position_size_pct = plan.get("position_size_pct", self.max_capital_per_stock_pct)
         confidence = plan.get("confidence_score", 5)
-        skip_rule = plan.get("skip_rule_time", "11:30")
+        from tradingagents.web.config_service import load_config as _lc
+        _cfg = _lc()
+        skip_rule = plan.get("skip_rule_time") or plan.get("skip_rule") or _cfg.get("execution_window_end")
+        upper_band_only = bool(_cfg.get("use_upper_band_only", True))
 
-        if not all([entry_low, entry_high, stop_loss, target_1]):
-            logger.warning("Incomplete trade plan for %s, skipping", ticker)
-            return None
+        if upper_band_only:
+            if not all([entry_high, stop_loss, target_1]):
+                logger.warning("Incomplete trade plan for %s, skipping (need entry_zone_high, stop_loss, target_1)", ticker)
+                return None
+            if entry_low is None:
+                entry_low = entry_high
+        else:
+            if not all([entry_high, stop_loss, target_1]) or entry_low is None:
+                logger.warning("Incomplete trade plan for %s, skipping", ticker)
+                return None
 
-        # Capital allocation
-        max_capital = self.position_tracker.capital * (position_size_pct / 100)
-        max_capital = min(max_capital, self.position_tracker.capital * (self.max_capital_per_stock_pct / 100))
+        # Capital allocation — only the cash that's not already committed by
+        # earlier pending orders is usable for the next order. Without this
+        # subtraction, placing multiple orders in a single phase would each
+        # see the full free_cash and over-allocate at fill time.
+        pending_reserved = self._pending_reserved_capital()
+        available = max(0.0, self.position_tracker.capital - pending_reserved)
+        max_capital = available * (position_size_pct / 100)
+        max_capital = min(max_capital, available * (self.max_capital_per_stock_pct / 100))
 
         # Quantity based on max loss
         risk_per_share = entry_high - stop_loss
@@ -64,7 +148,7 @@ class PaperTrader:
             logger.warning("Invalid risk for %s: SL >= entry", ticker)
             return None
 
-        max_loss_inr = self.position_tracker.capital * (self.max_loss_per_trade_pct / 100)
+        max_loss_inr = available * (self.max_loss_per_trade_pct / 100)
         qty = int(max_loss_inr / risk_per_share)
         capital_needed = qty * entry_high
 
@@ -73,7 +157,34 @@ class PaperTrader:
             capital_needed = qty * entry_high
 
         if qty <= 0:
-            logger.warning("Insufficient capital for %s", ticker)
+            logger.warning(
+                "Insufficient free cash for %s: available ₹%.2f (free_cash ₹%.2f, pending_reserved ₹%.2f)",
+                ticker, available, self.position_tracker.capital, pending_reserved,
+            )
+            return None
+
+        if capital_needed > available:
+            logger.warning(
+                "Order for %s would exceed free cash: needed ₹%.2f > available ₹%.2f. Skipping.",
+                ticker, capital_needed, available,
+            )
+            return None
+
+        # Hard ceiling: total commitments (pending + invested + this order) must
+        # not exceed initial capital. This catches edge cases where earlier
+        # arithmetic drifts due to partial fills or rounding.
+        invested = sum(
+            (p.entry_price or 0.0) * (p.quantity or 0)
+            for p in self.position_tracker.open_positions.values()
+        )
+        total_committed = pending_reserved + invested + capital_needed
+        if total_committed > self.position_tracker.initial_capital:
+            logger.warning(
+                "Order for %s would breach total capital ceiling: "
+                "pending ₹%.0f + invested ₹%.0f + this ₹%.0f = ₹%.0f > initial ₹%.0f. Skipping.",
+                ticker, pending_reserved, invested, capital_needed,
+                total_committed, self.position_tracker.initial_capital,
+            )
             return None
 
         order = Order(
@@ -107,9 +218,14 @@ class PaperTrader:
             logger.warning("Daily loss limit hit. Pausing trading.")
             return []
 
-        # Check hard exit
+        # Check hard exit (skipped in dry-run — dispatcher handles EOD explicitly)
         if current_time.time() >= time(self.hard_exit_hour, self.hard_exit_minute):
-            return self._execute_hard_exit(ticker, price, current_time)
+            try:
+                from tradingagents.web.config_service import load_config
+                if not load_config().get("dry_run_e2e", False):
+                    return self._execute_hard_exit(ticker, price, current_time)
+            except Exception:
+                return self._execute_hard_exit(ticker, price, current_time)
 
         events = []
 

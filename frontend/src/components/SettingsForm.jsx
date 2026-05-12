@@ -190,6 +190,37 @@ export default function SettingsForm() {
         </div>
       ))}
 
+      {/* Order placement: upper-band-only toggle */}
+      {(() => {
+        const item = allItems.find(i => i.key === 'use_upper_band_only')
+        if (!item) return null
+        const isOn = drafts.hasOwnProperty('use_upper_band_only') ? !!drafts['use_upper_band_only'] : !!item.value
+        return (
+          <div style={{ border: '1px solid #1a1a1a', borderRadius: 4, padding: 16, marginTop: 24, marginBottom: 8 }}>
+            <div style={{ color: '#9cf', fontWeight: 600, fontSize: 13, marginBottom: 10 }}>Order Placement</div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 10, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={isOn}
+                onChange={async e => {
+                  setDraft('use_upper_band_only', e.target.checked)
+                  await patchConfig('use_upper_band_only', e.target.checked)
+                  setMsg(e.target.checked
+                    ? 'Upper-band-only mode enabled — orders fill at price ≤ entry_zone_high; lower band is ignored at placement.'
+                    : 'Upper-band-only mode disabled — entry_zone_low is required and zone width is preserved at placement.')
+                }}
+              />
+              <span style={{ fontSize: 12 }}>
+                Use upper band only (ignore entry_zone_low when placing orders)
+              </span>
+            </label>
+            <div style={{ color: '#555', fontSize: 11, marginTop: 6, marginLeft: 26 }}>
+              {item.description}
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Dry Run E2E Testing toggle */}
       {(() => {
         const dryRunItem = allItems.find(i => i.key === 'dry_run_e2e')

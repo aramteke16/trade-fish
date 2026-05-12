@@ -49,6 +49,7 @@ def get_pipeline_state():
     return {
         "state": state_row.state,
         "state_since": state_row.state_since,
+        "last_heartbeat_at": state_row.last_heartbeat_at,
         "trade_date": state_row.trade_date,
         "next_run_at": state_row.next_run_at,
         "last_error": state_row.last_error,
@@ -68,11 +69,18 @@ def post_transition(body: TransitionRequest):
             status_code=400,
             detail=f"Unknown state {body.to!r}; valid: {list(sm.ALL_STATES)}",
         )
+    if dispatcher.has_active_background():
+        raise HTTPException(
+            status_code=409,
+            detail="A pipeline background task is still running; wait for it to finish before forcing a transition.",
+        )
     note = body.note or "manual override via /api/pipeline/transition"
-    new_row = sm.transition_to(body.to, note=note)
+    trade_date = datetime.now(IST).strftime("%Y-%m-%d") if body.to != sm.STATE_IDLE else sm.read_state().trade_date
+    new_row = sm.transition_to(body.to, trade_date=trade_date, note=note)
     return {
         "state": new_row.state,
         "state_since": new_row.state_since,
+        "last_heartbeat_at": new_row.last_heartbeat_at,
         "note": note,
     }
 
@@ -98,6 +106,11 @@ def post_run_now(stage: str):
     cfg = load_config()
     now = datetime.now(IST)
     state_row = sm.read_state()
+    if dispatcher.has_active_background():
+        raise HTTPException(
+            status_code=409,
+            detail="A pipeline background task is already running; run-now is disabled until it finishes.",
+        )
 
     try:
         next_state = handler(now, state_row, cfg)
@@ -106,7 +119,8 @@ def post_run_now(stage: str):
         raise HTTPException(status_code=500, detail=str(e))
 
     if next_state is not None and next_state != state_row.state:
-        sm.transition_to(next_state, note=f"manual run-now {stage!r}")
+        trade_date = state_row.trade_date or now.strftime("%Y-%m-%d")
+        sm.transition_to(next_state, trade_date=trade_date, note=f"manual run-now {stage!r}")
 
     return {
         "ran_stage": stage,
@@ -126,6 +140,12 @@ def force_rerun():
     from pathlib import Path
 
     today = datetime.now(IST).strftime("%Y-%m-%d")
+    if not dispatcher._cancel_background():
+        raise HTTPException(
+            status_code=409,
+            detail="A pipeline background task is still running; wait for it to finish before force rerun.",
+        )
+
     conn = get_conn()
     try:
         conn.execute("DELETE FROM trade_plans WHERE date = ?", (today,))
@@ -147,8 +167,7 @@ def force_rerun():
     except Exception as e:
         logger.warning("force-rerun: could not remove reports: %s", e)
 
-    dispatcher._cancel_background()
-    new_row = sm.transition_to(sm.STATE_PRECHECK, note="force rerun via UI")
+    new_row = sm.transition_to(sm.STATE_PRECHECK, trade_date=today, note="force rerun via UI")
     logger.info("force-rerun: cleared data for %s, transitioning to precheck", today)
 
     return {

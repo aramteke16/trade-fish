@@ -81,7 +81,16 @@ class OrderManager:
 
         # Check skip rule
         if order.skip_rule_time and not _is_force_fill():
-            skip_hour, skip_min = map(int, order.skip_rule_time.split(":"))
+            try:
+                skip_hour, skip_min = map(int, order.skip_rule_time.split(":"))
+            except (ValueError, AttributeError):
+                order.status = OrderStatus.EXPIRED
+                order.notes = f"Invalid skip_rule_time format: {order.skip_rule_time!r}"
+                logger.warning(
+                    "[order] EXPIRED %s %s — invalid skip_rule_time %r",
+                    order.order_id, order.ticker, order.skip_rule_time,
+                )
+                return False
             skip_dt = current_time.replace(hour=skip_hour, minute=skip_min, second=0, microsecond=0)
             if current_time > skip_dt:
                 order.status = OrderStatus.EXPIRED
@@ -94,7 +103,10 @@ class OrderManager:
                 return False
 
         force = _is_force_fill()
-        in_zone = order.entry_zone_low <= current_price <= order.entry_zone_high
+        if order.entry_zone_low < order.entry_zone_high:
+            in_zone = order.entry_zone_low <= current_price <= order.entry_zone_high
+        else:
+            in_zone = current_price <= order.entry_zone_high
         if in_zone or force:
             order.filled_price = current_price
             order.filled_qty = order.quantity

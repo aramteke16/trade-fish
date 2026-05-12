@@ -23,7 +23,11 @@ from tradingagents.execution.risk_manager import (
 )
 from tradingagents.pipeline.news_monitor import NewsAction, NewsMonitor
 from tradingagents.dataflows.indian_market import is_execution_window, IST
-from tradingagents.web.database import insert_position, update_position_exit
+from tradingagents.web.database import (
+    insert_position,
+    update_position_exit,
+    update_position_partial_exit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -356,7 +360,18 @@ class MarketMonitor:
                 "opened_at": now.isoformat(),
                 "is_dry_run": self._is_dry_run,
             })
-        elif event_type in ("exit", "partial_exit"):
+        elif event_type == "partial_exit":
+            pnl_str = f" P&L=Rs.{pnl:.2f}" if pnl is not None else ""
+            logger.info("PARTIAL EXIT: %s @ %.2f reason=%s%s", ticker, price, reason, pnl_str)
+            remaining = self.paper_trader.position_tracker.open_positions.get(ticker)
+            if remaining is not None:
+                update_position_partial_exit(ticker, now.strftime("%Y-%m-%d"), {
+                    "quantity": remaining.quantity,
+                    "stop_loss": remaining.stop_loss,
+                    "target_1": remaining.target_1,
+                    "target_2": remaining.target_2,
+                })
+        elif event_type == "exit":
             pnl_str = f" P&L=Rs.{pnl:.2f}" if pnl is not None else ""
             logger.info("EXIT: %s @ %.2f reason=%s%s", ticker, price, reason, pnl_str)
             update_position_exit(ticker, now.strftime("%Y-%m-%d"), {

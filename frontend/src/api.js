@@ -18,6 +18,12 @@ async function req(path, opts = {}) {
 export const getToday = (date) =>
   req(`/today${date ? `?date=${date}` : ''}`)
 export const getGlobalSummary = () => req('/global-summary')
+export const getCapitalLog = (date, limit = 200) => {
+  const q = new URLSearchParams()
+  if (date) q.set('date', date)
+  if (limit) q.set('limit', String(limit))
+  return req(`/capital/log${q.toString() ? `?${q}` : ''}`)
+}
 export const getLossAttribution = (days = 30) =>
   req(`/history/loss-attribution?days=${days}`)
 export const getPerformance = () => req('/performance')

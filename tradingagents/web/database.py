@@ -159,6 +159,7 @@ def init_db():
         id              INTEGER PRIMARY KEY CHECK (id = 1),
         state           TEXT    NOT NULL,
         state_since     TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        last_heartbeat_at TEXT,
         trade_date      TEXT,
         next_run_at     TEXT,
         last_error      TEXT,
@@ -200,6 +201,25 @@ def init_db():
         error         TEXT,
         summary       TEXT
     );
+
+    -- Intraday capital snapshot log. One row per dispatcher check or capital
+    -- event so the UI can render a live history table of how free cash, P&L,
+    -- and exposure evolved through the day.
+    CREATE TABLE IF NOT EXISTS capital_log (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        date                 TEXT NOT NULL,
+        at                   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        current_value        REAL,
+        start_capital        REAL,
+        free_cash            REAL,
+        invested             REAL,
+        pending_reserved     REAL,
+        realized_pnl         REAL,
+        unrealized_pnl       REAL,
+        open_positions_count INTEGER,
+        trigger              TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_capital_log_date ON capital_log(date);
     """)
 
     # Migrate trade_plans: add columns introduced after initial schema.
@@ -214,6 +234,21 @@ def init_db():
     pos_cols = {row[1] for row in conn.execute("PRAGMA table_info(positions)").fetchall()}
     if "is_dry_run" not in pos_cols:
         conn.execute("ALTER TABLE positions ADD COLUMN is_dry_run INTEGER DEFAULT 0")
+    state_cols = {row[1] for row in conn.execute("PRAGMA table_info(pipeline_state)").fetchall()}
+    if "last_heartbeat_at" not in state_cols:
+        conn.execute("ALTER TABLE pipeline_state ADD COLUMN last_heartbeat_at TEXT")
+
+    metric_cols = {row[1] for row in conn.execute("PRAGMA table_info(daily_metrics)").fetchall()}
+    if "start_capital" not in metric_cols:
+        conn.execute("ALTER TABLE daily_metrics ADD COLUMN start_capital REAL")
+    if "free_cash" not in metric_cols:
+        conn.execute("ALTER TABLE daily_metrics ADD COLUMN free_cash REAL")
+    if "invested" not in metric_cols:
+        conn.execute("ALTER TABLE daily_metrics ADD COLUMN invested REAL DEFAULT 0")
+    if "pending_reserved" not in metric_cols:
+        conn.execute("ALTER TABLE daily_metrics ADD COLUMN pending_reserved REAL DEFAULT 0")
+    if "is_finalized" not in metric_cols:
+        conn.execute("ALTER TABLE daily_metrics ADD COLUMN is_finalized INTEGER DEFAULT 0")
     conn.commit()
 
     # Seed app_config from DEFAULT_CONFIG. Idempotent — INSERT OR IGNORE
@@ -223,9 +258,9 @@ def init_db():
     # Seed the single pipeline_state row in the same idempotent style.
     from tradingagents.dataflows.indian_market import IST
     conn.execute(
-        "INSERT OR IGNORE INTO pipeline_state (id, state, state_since) "
-        "VALUES (1, 'idle', ?)",
-        (datetime.now(IST).isoformat(),),
+        "INSERT OR IGNORE INTO pipeline_state (id, state, state_since, last_heartbeat_at) "
+        "VALUES (1, 'idle', ?, ?)",
+        (datetime.now(IST).isoformat(), datetime.now(IST).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -382,23 +417,71 @@ def update_position_exit(ticker: str, date: str, exit_data: dict):
         conn.close()
 
 
-def insert_daily_metrics(metrics: dict):
+def update_position_partial_exit(ticker: str, date: str, partial_data: dict):
+    """Keep a partially-exited position open with its remaining quantity."""
     conn = get_conn()
     try:
         conn.execute("""
-            INSERT OR REPLACE INTO daily_metrics
-            (date, capital, daily_pnl, daily_return_pct, total_trades, win_rate, max_drawdown_pct, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            UPDATE positions SET
+                quantity = ?, stop_loss = ?, target_1 = ?, target_2 = ?
+            WHERE ticker = ? AND date = ? AND status = 'open'
         """, (
-            metrics.get("date", datetime.now().strftime("%Y-%m-%d")),
-            metrics.get("capital"),
-            metrics.get("daily_pnl"),
-            metrics.get("daily_return_pct"),
-            metrics.get("total_trades"),
-            metrics.get("win_rate"),
-            metrics.get("max_drawdown_pct"),
-            metrics.get("notes"),
+            partial_data.get("quantity"),
+            partial_data.get("stop_loss"),
+            partial_data.get("target_1"),
+            partial_data.get("target_2"),
+            ticker, date,
         ))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def insert_daily_metrics(metrics: dict):
+    """Upsert today's daily_metrics row.
+
+    Stats columns (capital, daily_pnl, total_trades, win_rate, max_drawdown_pct, notes)
+    are overwritten. The intraday capital columns managed by capital_service
+    (start_capital, free_cash, invested, pending_reserved, is_finalized) are
+    preserved if already set.
+    """
+    conn = get_conn()
+    try:
+        date = metrics.get("date", datetime.now().strftime("%Y-%m-%d"))
+        existing = conn.execute(
+            "SELECT id FROM daily_metrics WHERE date = ?", (date,)
+        ).fetchone()
+        if existing is None:
+            conn.execute("""
+                INSERT INTO daily_metrics
+                (date, capital, daily_pnl, daily_return_pct, total_trades, win_rate, max_drawdown_pct, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                date,
+                metrics.get("capital"),
+                metrics.get("daily_pnl"),
+                metrics.get("daily_return_pct"),
+                metrics.get("total_trades"),
+                metrics.get("win_rate"),
+                metrics.get("max_drawdown_pct"),
+                metrics.get("notes"),
+            ))
+        else:
+            conn.execute("""
+                UPDATE daily_metrics SET
+                    capital = ?, daily_pnl = ?, daily_return_pct = ?,
+                    total_trades = ?, win_rate = ?, max_drawdown_pct = ?, notes = ?
+                WHERE date = ?
+            """, (
+                metrics.get("capital"),
+                metrics.get("daily_pnl"),
+                metrics.get("daily_return_pct"),
+                metrics.get("total_trades"),
+                metrics.get("win_rate"),
+                metrics.get("max_drawdown_pct"),
+                metrics.get("notes"),
+                date,
+            ))
         conn.commit()
     finally:
         conn.close()

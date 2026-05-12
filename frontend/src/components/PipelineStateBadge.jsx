@@ -13,6 +13,7 @@ export default function PipelineStateBadge() {
   const [busy, setBusy] = useState(false)
   const state = data?.state || '...'
   const since = data?.state_since
+  const heartbeat = data?.last_heartbeat_at
   const isActive = state === 'precheck' || state === 'monitor' || state === 'waiting'
   const canRerun = state === 'idle' || state === 'waiting' || state === 'holiday'
 
@@ -42,7 +43,10 @@ export default function PipelineStateBadge() {
         }} />
         <span style={{ fontWeight: 500, fontSize: 12 }}>{state}</span>
         {since && (
-          <span style={{ color: '#444', fontSize: 11 }}>{fmtTime(since)}</span>
+          <span style={{ color: '#444', fontSize: 11 }}>since {fmtTime(since)}</span>
+        )}
+        {heartbeat && heartbeat !== since && (
+          <span style={{ color: '#555', fontSize: 11 }}>live {fmtTime(heartbeat)}</span>
         )}
       </div>
       {canRerun && (

@@ -1,394 +1,806 @@
 # End-to-End Pipeline Flow
 
-This document explains how the complete intraday trading pipeline works — from stock selection to trade execution to daily reporting.
+This is the source-of-truth doc for how the intraday trading pipeline actually
+runs today — from the moment the FastAPI process boots, through the daily
+state machine, into order placement, the monitoring loop, capital tracking,
+and the UI surfaces that visualise all of it.
+
+If you change a state handler, the capital model, or a DB column,
+**update this file in the same PR.**
 
 ---
 
-## High-Level Architecture
+## 1. Bird's-eye view
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         run_pipeline.py                                  │
-├─────────┬─────────────┬──────────────┬──────────────────┬───────────────┤
-│ Phase 1 │   Phase 2   │   Phase 3    │     Phase 4      │   Phase 5     │
-│ Screen  │   Analyze   │   Execute    │    Monitor       │   Report      │
-│ (08:30) │  (08:30-10) │   (10:30)    │  (10:30-15:15)   │   (15:20)     │
-└────┬────┴──────┬──────┴──────┬───────┴────────┬─────────┴───────┬───────┘
-     │           │             │                │                 │
-     ▼           ▼             ▼                ▼                 ▼
- Screener   TradingAgents   PaperTrader    MarketMonitor       SQLite DB
-             Graph (LLM)                    (yfinance)        (web dashboard)
+┌──────────────────────────────────────────────────────────────────────────┐
+│  FastAPI process                                                         │
+│                                                                          │
+│  ┌──────────────────────────┐    ┌─────────────────────────────────────┐ │
+│  │ APScheduler              │    │ FastAPI HTTP                        │ │
+│  │   • dispatch_pipeline()  │    │   /api/today, /api/pipeline/*,      │ │
+│  │     every 60s            │    │   /api/capital/log, /api/config/*   │ │
+│  └────────────┬─────────────┘    └─────────────────┬───────────────────┘ │
+│               │                                    │                     │
+│               ▼                                    ▼                     │
+│  ┌──────────────────────────────────────────────────────────────────┐    │
+│  │ State machine  (pipeline_state row + history)                     │   │
+│  │   idle → precheck → waiting → monitor → analysis → idle           │   │
+│  │                                  ↓                                │   │
+│  │                              holiday (weekend / NSE holiday)      │   │
+│  └─────────────────────────┬────────────────────────────────────────┘    │
+│                            │                                             │
+│      Long handlers run in a single-threaded background executor          │
+│      (precheck, waiting, analysis). monitor + idle + holiday run inline. │
+└──────────────────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+          ┌─────────────────────────────────────────┐
+          │  Per-day in-memory runtime cache         │
+          │  _daily_runtime[trade_date] = {          │
+          │     "paper_trader": PaperTrader,         │
+          │     "monitor":      MarketMonitor,       │
+          │     "plans":        [trade_plans...],    │
+          │     "order_ids":    [...],               │
+          │  }                                       │
+          └─────────────────────────────────────────┘
+                            │
+                            ▼
+          ┌─────────────────────────────────────────┐
+          │ SQLite (cross-day persistence)           │
+          │   pipeline_state / pipeline_state_history│
+          │   trade_plans / agent_reports / debates  │
+          │   positions                              │
+          │   daily_metrics  (+ capital buckets)     │
+          │   capital_log    (intraday snapshots)    │
+          │   app_config / config_changes            │
+          │   token_usage                            │
+          └─────────────────────────────────────────┘
 ```
+
+Key principles:
+
+- **One scheduler, one job.** A single 60s APScheduler interval job
+  (`dispatch_pipeline`) drives everything. There is no second cron.
+- **State machine in SQLite, runtime in memory.** The `pipeline_state` table
+  has exactly one row that the dispatcher reads each tick. The expensive
+  per-day instances (`PaperTrader`, `MarketMonitor`) live in
+  `_daily_runtime` and survive across ticks but are recreated on restart
+  from DB.
+- **Long handlers go to a background thread.** `precheck`, `waiting`, and
+  `analysis` are offloaded to a `ThreadPoolExecutor(max_workers=1)` so the
+  60s tick never blocks. `monitor`, `idle`, and `holiday` run inline.
+- **Every capital change is snapshotted.** Both `daily_metrics`
+  (single-row-per-day rolled state) and `capital_log` (append-only history)
+  are written at each meaningful event.
 
 ---
 
-## Phase 1: Stock Screening
+## 2. State machine
 
-**Entry point**: `run_pipeline.py:run_screener(top_n=5)`
+File: `tradingagents/pipeline/state_machine.py`
+File: `tradingagents/pipeline/dispatcher.py`
 
-**Input**: Hardcoded universe of 149 NSE tickers (`tradingagents/screener/universe.py`)
+### 2.1 States
 
-**Process**:
+| State      | Meaning                                                                       | Runs in    |
+| ---------- | ----------------------------------------------------------------------------- | ---------- |
+| `idle`     | Waiting for `precheck_time` (default 08:10 IST).                              | inline     |
+| `precheck` | Screener → multi-agent analysis. Produces actionable plans.                   | background |
+| `waiting`  | Plans in hand, waiting for `execution_time` (09:30) to place orders.          | background |
+| `monitor`  | Orders live. Polling prices, applying trailing stops, news exits, partials.   | inline     |
+| `analysis` | Day done. Reporting + EOD reflection + capital finalize.                      | background |
+| `holiday`  | NSE closed (weekend / NSE_HOLIDAYS_2026). Skips precheck until next open day. | inline     |
 
-1. Takes the first 80 tickers from `NSE_MIDCAP_SMALLCAP_UNIVERSE`
-2. For each ticker, fetches 30 days of OHLCV from yfinance
-3. Applies three filters (`tradingagents/screener/filters.py`):
-   - **Liquidity**: avg daily turnover >= Rs.5 Crores
-   - **Volatility**: 14-day ATR >= 1.5% of price
-   - **Price band**: Rs.50 - Rs.50,000
-4. Stocks that pass all filters go to the Ranker (`tradingagents/screener/ranker.py`)
-5. Ranker computes composite score: `0.4*momentum + 0.3*volume + 0.3*volatility`
-   - Momentum: 5-day and 20-day returns (favours upward trend)
-   - Volume: recent 5-day avg vs historical avg (favours surging interest)
-   - Volatility: prefers 1.5-5% ATR (sweet spot for intraday)
-6. Returns top N stocks sorted by composite score
+### 2.2 Transitions
 
-**Output**: `List[dict]` — each dict has `ticker`, `price`, `avg_volume_inr_crores`, `atr_pct`, `composite_score`
+```
+idle ─[now ≥ precheck_time AND not already ran today]─► precheck
+precheck ─[plans built]──────────────────────────────► waiting
+waiting ─[now ≥ execution_time, orders placed]──────► monitor
+monitor ─[execution window closed AND no open pos]──► analysis
+analysis ─[reporting + reflection done]─────────────► idle
+
+(any state) ─[market closed today]──► holiday ──► idle (next trading day)
+```
+
+Notes:
+
+- `monitor` stays put past the window if open positions remain — the
+  monitor's own `tick()` runs the hard-exit and the next tick promotes to
+  `analysis`.
+- `has_completed_today(stage, date)` is checked via
+  `pipeline_state_history` so the dispatcher won't re-enter `precheck` the
+  same day even if it crashes back to `idle`.
+
+### 2.3 `pipeline_state` columns
+
+| Column              | Purpose                                                       |
+| ------------------- | ------------------------------------------------------------- |
+| `state`             | One of the 6 state strings.                                   |
+| `state_since`       | ISO timestamp the state was **entered**. Never bumped on heartbeat. |
+| `last_heartbeat_at` | ISO timestamp updated on every no-op tick — proves "alive".   |
+| `trade_date`        | Today's date in IST. Pinned by `_trade_date_for_transition`.  |
+| `next_run_at`       | Informational; APScheduler does the real scheduling.          |
+| `last_error`        | Traceback string when a handler crashes.                      |
+| `payload`           | JSON dict per state (e.g. `{"plan_count": 3, ...}`).          |
+
+The split between `state_since` (entry time) and `last_heartbeat_at`
+(liveness) matters: it lets the UI show *both* "in state X for 22 min" and
+"last alive 18s ago".
+
+### 2.4 Dispatcher tick anatomy
+
+`dispatch_pipeline()` runs on a 60s interval:
+
+```
+read pipeline_state from DB
+if market is closed and state ∉ {analysis, holiday}:
+    cancel any running bg task; transition → holiday
+    return
+
+handler = STATE_HANDLERS[state]
+
+if state ∈ {precheck, waiting, analysis}:
+    if bg_future is running:
+        update heartbeat; return                    ← 60s no-op tick
+    if bg_future just completed:
+        next_state = bg_future.result()
+        transition_to(next_state) (with trade_date)
+        return
+    else:
+        spawn handler in bg_executor; return
+else:                                               ← idle / monitor / holiday
+    inline run handler
+    transition_to(next_state)  OR  touch_heartbeat()
+```
+
+The key guarantee: **only one background handler can run at a time**.
+`_cancel_background()` returns `False` if the bg task has already started
+(Python can't safely stop a running thread), and the API layer translates
+that into HTTP 409 for `force-rerun` / manual transitions to prevent racy
+data writes.
 
 ---
 
-## Phase 2: Multi-Agent Analysis
+## 3. Per-state behaviour
 
-**Entry point**: `run_pipeline.py:run_analysis_phase(top_stocks)`
-
-**Input**: Top 5 screened stocks from Phase 1
-
-**For each stock**, calls `TradingAgentsGraph.propagate(ticker, date)`:
-
-### The Agent Graph (LangGraph StateGraph)
-
-```
-                    ┌───────────────────────────────────┐
-                    │        Initial State              │
-                    │  (ticker, date, memory context)   │
-                    └───────────────┬───────────────────┘
-                                    │
-                    ┌───────────────▼───────────────────┐
-                    │      6 Analyst Agents (parallel)   │
-                    ├───────────────────────────────────┤
-                    │ 1. Market Analyst                  │
-                    │    - get_stock_data (OHLCV)        │
-                    │    - get_indicators (SMA/EMA/RSI)  │
-                    │                                    │
-                    │ 2. Retail Sentiment Analyst        │
-                    │    - get_news                      │
-                    │                                    │
-                    │ 3. Institutional Sentiment Analyst │
-                    │    - get_news                      │
-                    │    - get_fii_dii_data (NEW)        │
-                    │                                    │
-                    │ 4. Contrarian Sentiment Analyst    │
-                    │    - get_news                      │
-                    │                                    │
-                    │ 5. News Analyst                    │
-                    │    - get_news + get_global_news    │
-                    │    - get_insider_transactions      │
-                    │                                    │
-                    │ 6. Fundamentals Analyst            │
-                    │    - get_fundamentals              │
-                    │    - get_balance_sheet/cashflow    │
-                    │    - get_income_statement          │
-                    └───────────────┬───────────────────┘
-                                    │ 6 reports
-                    ┌───────────────▼───────────────────┐
-                    │    Investment Debate (Bull vs Bear) │
-                    │    - Bull argues for buying         │
-                    │    - Bear argues for selling        │
-                    │    - Judge decides winner           │
-                    │    (max_debate_rounds = 1)          │
-                    └───────────────┬───────────────────┘
-                                    │
-                    ┌───────────────▼───────────────────┐
-                    │      Research Manager              │
-                    │  Synthesizes all reports + debate  │
-                    │  into a unified research brief     │
-                    └───────────────┬───────────────────┘
-                                    │
-                    ┌───────────────▼───────────────────┐
-                    │          Trader                    │
-                    │  Proposes entry/SL/targets based   │
-                    │  on Research Manager's brief       │
-                    └───────────────┬───────────────────┘
-                                    │
-                    ┌───────────────▼───────────────────┐
-                    │  Risk Debate (3 debaters)          │
-                    │  - Aggressive: "add position"      │
-                    │  - Conservative: "reduce risk"     │
-                    │  - Neutral: balanced view          │
-                    │  - Judge decides final sizing      │
-                    │  (max_risk_discuss_rounds = 1)     │
-                    └───────────────┬───────────────────┘
-                                    │
-                    ┌───────────────▼───────────────────┐
-                    │      Portfolio Manager (PM)        │
-                    │  Makes final call:                 │
-                    │  - Rating: Buy/Overweight/Hold/    │
-                    │            Underweight/Sell        │
-                    │  - Entry Zone, Stop Loss, Targets  │
-                    │  - Confidence /10, Position Size % │
-                    │  - Skip Rule, Thesis              │
-                    └───────────────┬───────────────────┘
-                                    │
-                                    ▼
-                    (final_state dict, rating string)
-```
-
-### LLM Configuration
-
-| Role                            | Model                       | Provider |
-| ------------------------------- | --------------------------- | -------- |
-| Analysts, Debates, Research Mgr | `kimi-k2.5` (quick)         | Moonshot |
-| Trader, Portfolio Manager       | `kimi-k2.6` (deep thinking) | Moonshot |
-
-The deep-think model (K2.6) has thinking mode enabled. Since Moonshot's API rejects `tool_choice` with thinking active, the Trader and PM use **free-text generation** (no structured output binding). Their markdown output is parsed by `plan_extractor.py` using regex.
-
-### Plan Extraction
-
-After `propagate()` returns, `plan_extractor.py` parses the PM's markdown output:
-
-```
-**Entry Zone**: ₹6,420 - ₹6,480    →  entry_zone_low=6420, entry_zone_high=6480
-**Stop Loss**: ₹6,350              →  stop_loss=6350
-**Target 1**: ₹6,550               →  target_1=6550
-**Target 2**: ₹6,700               →  target_2=6700
-**Confidence**: 7/10                →  confidence_score=7
-**Position Size %**: 20%            →  position_size_pct=20
-**Skip Rule**: Don't enter after 11:30  →  skip_rule="Don't enter after 11:30"
-```
-
-Falls back to Trader output if PM lacks levels, then to free-text regex patterns.
-
-### Database Persistence
-hello 
-Regardless of the rating, Phase 2 saves to SQLite:
-
-- **trade_plans**: ticker, date, rating, entry/SL/targets, thesis
-- **agent_reports**: each analyst's report (Market, Sentiment×3, News, Fundamentals, PM)
-- **debates**: bull/bear arguments, judge verdict, confidence
-
-### Filtering for Execution
-
-Only plans with rating = `Buy` or `Overweight` AND valid entry_zone + stop_loss proceed to Phase 3. Hold/Underweight/Sell are tracked in DB but not traded.
-
-**Output**: `List[dict]` — actionable trade plans
-
----
-
-## Phase 3: Order Execution
-
-**Entry point**: `run_pipeline.py:run_execution_phase(plans, paper_trader)`
-
-**Input**: Actionable trade plans from Phase 2
-
-**Process** (`tradingagents/execution/paper_trader.py`):
-
-For each plan, `PaperTrader.place_trade_plan(plan)`:
-
-1. Checks if trading is paused (daily loss limit hit)
-2. Calculates quantity:
-   - Max capital per stock = 25% of total (Rs.5,000 from Rs.20,000)
-   - Max loss per trade = 1.5% of capital (Rs.300)
-   - `qty = max_loss_inr / (entry_high - stop_loss)`
-   - Capped by max_capital: `qty = max_capital / entry_high`
-3. Creates an `Order` object with zones, SL, targets
-4. Places order into `OrderManager` (state = PENDING)
-
-**Output**: List of order IDs (strings)
-
----
-
-## Phase 4: Market Monitoring
-
-**Entry point**: `run_pipeline.py:run_monitoring_phase(paper_trader)`
-
-**Input**: PaperTrader with pending orders
-
-**Process** (`tradingagents/pipeline/market_monitor.py`):
-
-Runs from current time until 15:15 IST:
-
-```
-Every 120 seconds:
-│
-├── Get tracked tickers (pending orders + open positions)
-├── For each ticker:
-│   └── yf.Ticker(t).fast_info["lastPrice"]
-│
-├── Feed each price into paper_trader.on_price_tick(ticker, price, time)
-│   │
-│   ├── Check pending orders:
-│   │   └── If price is within entry_zone_low-high → FILL order → open position
-│   │
-│   └── Check open positions:
-│       ├── price <= stop_loss → EXIT (loss), log event
-│       ├── price >= target_1 → PARTIAL EXIT 50%, move SL to breakeven
-│       └── price >= target_2 → FULL EXIT (profit), log event
-│
-└── Persist events to SQLite (insert_position)
-
-At 15:15 IST:
-└── hard_exit_all() → close all remaining positions at market price
-```
-
-### Risk Controls (checked every tick)
-
-| Rule               | Limit                  | Action                    |
-| ------------------ | ---------------------- | ------------------------- |
-| Max loss per trade | 1.5% of capital        | Built into stop-loss      |
-| Daily loss limit   | 3% of capital (Rs.600) | Pause all trading         |
-| Weekly loss limit  | 5% of capital          | Warning                   |
-| Hard exit time     | 15:15 IST              | Force close everything    |
-| Skip rule time     | 11:30 IST              | Don't enter new positions |
-
-**Output**: All positions closed by 15:15
-
----
-
-## Phase 5: Daily Reporting
-
-**Entry point**: `run_pipeline.py:run_reporting_phase(paper_trader)`
-
-**Input**: PaperTrader with completed trades
-
-**Process**:
-
-1. Reads metrics from `paper_trader.get_state()["metrics"]`:
-   - current_capital, daily_pnl, total_return_pct
-   - total_trades, winning_trades, win_rate
-   - max_drawdown_pct
-2. Saves to SQLite via `insert_daily_metrics()`
-3. Web dashboard reads from SQLite to display performance
-
-**Output**: Row in `daily_metrics` table
-
----
-
-## Data Flow Summary
-
-```
-NSE Universe (149 tickers, hardcoded in screener/universe.py)
-    │
-    │ ScreenFilters: liquidity ≥ ₹5Cr, ATR ≥ 1.5%, price ₹50-50K
-    │ Uses: yfinance 30-day OHLCV
-    ▼
-~20-30 stocks pass filters
-    │
-    │ Ranker: composite_score = 0.4*momentum + 0.3*volume + 0.3*volatility
-    ▼
-Top 5 stocks (by composite score)
-    │
-    │ TradingAgentsGraph.propagate(ticker, date) × 5 (sequential)
-    │ Uses: Kimi K2.5/K2.6 via Moonshot API
-    │ Duration: ~3-5 min per stock = ~15-25 min total
-    ▼
-5 × (final_state, rating)
-    │
-    │ plan_extractor.extract_trade_plan() — regex parse PM markdown
-    │ → All saved to SQLite (trade_plans, agent_reports, debates)
-    ▼
-N actionable plans (only Buy/Overweight with valid levels)
-    │
-    │ PaperTrader.place_trade_plan()
-    │ qty = min(max_loss/risk, max_capital/price)
-    ▼
-Pending orders (waiting for entry zone hit)
-    │
-    │ MarketMonitor polls yfinance every 2 min (10:30 → 15:15)
-    │ → on_price_tick() checks entry zones → fills
-    │ → Monitors SL/targets → exits
-    ▼
-Filled → Monitored → Exited (by SL, Target, or Hard Exit)
-    │
-    │ All events → SQLite (positions table)
-    ▼
-15:15 hard_exit_all()
-    │
-    │ insert_daily_metrics()
-    ▼
-SQLite DB → Web Dashboard (run_web.py)
-```
-
----
-
-## Automation (daily_runner.py)
-
-For hands-free operation, `daily_runner.py` uses APScheduler:
-
-| Time (IST) | Job                         | What it does                                           |
-| ---------- | --------------------------- | ------------------------------------------------------ |
-| 08:30      | `job_screen_and_analyze()`  | Screen 80 stocks, rank top 5, run multi-agent analysis |
-| 10:30      | `job_execute_and_monitor()` | Place orders, poll prices until 15:15                  |
-| 15:20      | `job_daily_report()`        | Save metrics to DB                                     |
-
-Jobs share state via a module-level `_daily_state` dict (plans from 08:30 are used at 10:30).
-
-```bash
-# Start scheduler (runs forever, Mon-Fri only)
-python -m tradingagents.pipeline.daily_runner
-
-# Test all jobs once sequentially
-python -m tradingagents.pipeline.daily_runner --once
-```
-
----
-
-## Key Files Reference
-
-| File                                          | Purpose                                 |
-| --------------------------------------------- | --------------------------------------- |
-| `run_pipeline.py`                             | Main orchestrator (5 phases)            |
-| `tradingagents/screener/universe.py`          | Hardcoded 149 NSE tickers               |
-| `tradingagents/screener/filters.py`           | Liquidity/ATR/price filters             |
-| `tradingagents/screener/ranker.py`            | Composite scoring and ranking           |
-| `tradingagents/graph/trading_graph.py`        | LangGraph agent orchestration           |
-| `tradingagents/graph/setup.py`                | StateGraph wiring (nodes + edges)       |
-| `tradingagents/agents/`                       | All agent implementations               |
-| `tradingagents/pipeline/plan_extractor.py`    | Regex parse PM output → trade plan dict |
-| `tradingagents/pipeline/fii_dii.py`           | MoneyControl FII/DII scraping           |
-| `tradingagents/pipeline/market_monitor.py`    | yfinance price polling loop             |
-| `tradingagents/pipeline/daily_runner.py`      | APScheduler automation                  |
-| `tradingagents/execution/paper_trader.py`     | Paper trading engine                    |
-| `tradingagents/execution/order_manager.py`    | Order state machine                     |
-| `tradingagents/execution/position_tracker.py` | Position P&L tracking                   |
-| `tradingagents/web/database.py`               | SQLite schema + insert functions        |
-| `tradingagents/web/app.py`                    | Flask web dashboard                     |
-| `tradingagents/default_config.py`             | All configurable parameters             |
-| `tradingagents/llm_clients/openai_client.py`  | Moonshot/DeepSeek LLM client            |
-
----
-
-## Configuration (`default_config.py`)
+### 3.1 `idle` (inline)
 
 ```python
-"llm_provider": "moonshot"           # LLM provider
-"deep_think_llm": "kimi-k2.6"       # For Trader + PM (thinking mode)
-"quick_think_llm": "kimi-k2.5"      # For Analysts + Debates (fast)
-"initial_capital": 20000             # Rs.20K paper trading capital
-"max_capital_per_stock_pct": 25      # Max 25% per stock
-"max_loss_per_trade_pct": 1.5        # Max 1.5% loss per trade
-"daily_loss_limit_pct": 3.0          # Pause at 3% daily loss
-"hard_exit_time": "15:15"            # Force close all positions
-"max_debate_rounds": 1               # Bull/Bear debate rounds
-"max_risk_discuss_rounds": 1         # Risk debate rounds
+if now < precheck_time: stay
+if precheck already ran today: stay
+return STATE_PRECHECK
+```
+
+### 3.2 `precheck` (background, one-shot)
+
+1. Clear today's runtime cache.
+2. Screener (`run_screener(top_n=cfg.top_k_positions)`)
+   - Skipped in dry-run mode (one hard-coded ticker is used).
+3. Multi-agent analysis (`run_analysis_phase`) for each top stock in
+   parallel — each ticker gets its own `TradingAgentsGraph` thread.
+4. Cross-stock allocator (`rank_and_allocate`) picks the top-K and sizes
+   them; force-promotes the best `Skip` if everything came back `Skip`.
+5. Plans written to `trade_plans` + agent reports + debates.
+6. Plans cached at `_daily_runtime[trade_date]["plans"]`.
+
+Returns `STATE_WAITING` (or `STATE_IDLE` if nothing actionable).
+
+### 3.3 `waiting` (background)
+
+Fires once `now ≥ execution_time`. It is the **capital opening ritual**:
+
+1. Recover plans:
+   - First, in-memory cache.
+   - Fallback: re-read Buy plans from `trade_plans` (handles container
+     restarts mid-day).
+2. Compute `starting_capital = get_latest_capital(default=initial_capital,
+   before_date=trade_date)` — the EOD `capital` from the most recent
+   finalized `daily_metrics` row, otherwise the configured seed.
+3. Build a fresh `PaperTrader(initial_capital=starting_capital)` and cache
+   it in `_daily_runtime`.
+4. `capital_service.init_day(trade_date, starting_capital)`
+   — seeds `daily_metrics` with `start_capital`, `free_cash = start_capital`,
+   `invested = 0`, `pending_reserved = 0`, `daily_pnl = 0`, `is_finalized = 0`.
+5. `_snapshot_capital(..., trigger="day_init")` writes the very first
+   `capital_log` row.
+6. `run_execution_phase(plans, paper_trader)` for each plan:
+   - Live-price fetch + optional zone shift (see §4).
+   - `paper_trader.place_trade_plan(plan)` (see §5 for guards).
+7. `_snapshot_capital(..., trigger="orders_placed")`.
+
+Returns `STATE_MONITOR` if any orders went pending, else `STATE_ANALYSIS`.
+
+### 3.4 `monitor` (inline, throttled)
+
+The most active state. See §6 for the full monitor loop.
+
+### 3.5 `analysis` (background, one-shot)
+
+1. `run_reporting_phase` — writes `daily_metrics` stats (trades, win rate,
+   drawdown). Uses UPSERT so it preserves the capital buckets written by
+   `waiting`/`monitor`.
+2. `run_eod_reflection` — fast classifier post-mortem per closed trade,
+   appended to the memory log for tomorrow's PM.
+3. `_snapshot_capital(..., trigger="day_finalized")`.
+4. `capital_service.finalize_day(trade_date)` —
+   `capital = start_capital + daily_pnl`, `is_finalized = 1`.
+   That `capital` value becomes tomorrow's `start_capital`.
+5. Clear runtime cache.
+
+Returns `STATE_IDLE`.
+
+### 3.6 `holiday`
+
+If the market is still closed → stay. Otherwise → `idle`.
+
+---
+
+## 4. Live-price zone shift (execution-time anchoring)
+
+`run_pipeline._adjust_plan_to_live_price` runs once per ticker right before
+`place_trade_plan`. Behaviour depends on `use_upper_band_only`:
+
+- **`use_upper_band_only = True` (default).** Anchor on `entry_zone_high`.
+  If `|live_price - entry_zone_high| > 1%`, shift all of
+  `{entry_zone_low, entry_zone_high, stop_loss, target_1, target_2}` by
+  `live_price - entry_zone_high`, preserving R:R. Order behaves like a
+  buy-limit at the upper band.
+- **`use_upper_band_only = False` (legacy).** Anchor on zone mid; expand
+  the zone around `live_price` keeping the half-width.
+
+If the live price is within the tolerance, the agent's levels are used
+verbatim. Adjusted levels are persisted to `trade_plans.price_adjusted_pct`
+so the UI can show "(zone shifted +1.3%)".
+
+---
+
+## 5. Order placement
+
+`PaperTrader.place_trade_plan(plan)` — every check below has to pass or the
+order is rejected:
+
+1. **Pause check.** `trading_paused` is set when the daily loss limit hits;
+   no new orders until reset.
+2. **Duplicate guard.** Reject if any order for that ticker is `PENDING` or
+   `FILLED` today, or a position is already open.
+3. **Plan completeness.** When `use_upper_band_only` is true, require
+   `entry_zone_high`, `stop_loss`, `target_1` (and default `entry_zone_low`
+   to `entry_zone_high` if missing). Otherwise require both bands.
+4. **Capital availability.**
+   - `pending_reserved = Σ entry_zone_high × qty` over **other** pending
+     orders.
+   - `available = position_tracker.capital − pending_reserved`.
+   - `max_capital = available × min(position_size_pct,
+     max_capital_per_stock_pct) / 100`.
+5. **Quantity sizing.**
+   - `risk_per_share = entry_high − stop_loss` (must be > 0).
+   - `max_loss_inr = available × max_loss_per_trade_pct / 100`.
+   - `qty = floor(max_loss_inr / risk_per_share)`.
+   - Capped by `max_capital`: `qty = floor(max_capital / entry_high)`.
+6. **Hard checks.**
+   - `qty > 0` else "insufficient free cash".
+   - `capital_needed = qty × entry_high ≤ available`.
+   - `pending_reserved + invested + capital_needed ≤ initial_capital`
+     ("total commitments ceiling") — catches partial-fill / rounding drift.
+
+When all pass, the order goes into `OrderManager` with status `PENDING`.
+
+> **Order ID is shared with the eventual position** — `OrderManager`'s
+> `order_id` is reused as `Position.order_id` so `check_exit` on every tick
+> can look up the correct SL/target levels even after trailing.
+
+---
+
+## 6. Monitoring pipeline (the live loop)
+
+This is where the project spends most of the day. `handle_monitor` in
+`dispatcher.py` runs **inline** on the 60s dispatcher tick, but the real
+poll work is throttled to `dispatcher_monitor_interval_sec`
+(default 600 = 10 minutes).
+
+### 6.1 Tick entry — `handle_monitor`
+
+```
+poll_interval = 60 if dry_run else dispatcher_monitor_interval_sec
+hard_exit_due = now ≥ hard_exit_time  (default 15:15)
+
+# Gates
+if not hard_exit_due and now < execution_window_start (10:30): return
+if not hard_exit_due and elapsed_since_last_tick < poll_interval: return
+
+# Recover the day's PaperTrader from cache or DB
+paper_trader = _daily_runtime[date]["paper_trader"]
+           or _restore_paper_trader_from_db(date, cfg)
+
+# Nothing to do? Jump straight to analysis.
+if no pending orders and no open positions: return STATE_ANALYSIS
+
+# Build/reuse the MarketMonitor (with risk thresholds + news monitor)
+monitor = _daily_runtime[date]["monitor"]  # reused across ticks
+
+window_closed = monitor.tick(now)          # see §6.2
+_snapshot_capital(date, paper_trader,
+                  trigger="hard_exit" if window_closed else "monitor_tick",
+                  current_prices=monitor._last_prices)
+```
+
+`_restore_paper_trader_from_db` is the recovery path for process restarts:
+- Rebuilds open positions from the `positions` table (status=open today).
+- Re-places pending orders from `trade_plans` for any Buy with no
+  matching position yet.
+
+The `MarketMonitor` instance is **deliberately reused** across ticks so
+internal state like the dry-run price index and `_last_prices` survives.
+
+### 6.2 What `MarketMonitor.tick()` does
+
+`tradingagents/pipeline/market_monitor.py`
+
+```
+1. _reload_config()         ← pulls live values from app_config
+                              (risk thresholds, news toggle,
+                               execution window, dry-run flag)
+
+2. if (not dry_run) and outside execution window:
+       _hard_exit_all(now)
+       return True                ← window closed; tell dispatcher
+
+3. tickers = open orders ∪ open positions
+   prices  = yfinance fast_info (or dry-run sequence)
+   self._last_prices = {valid subset}
+
+4. apply_trailing_stops(positions, all_orders, prices)
+       - Breakeven trigger: if unrealized% ≥ breakeven_trigger_pct,
+         raise SL to entry.
+       - Trail trigger:     if unrealized% ≥ trail_trigger_pct,
+         raise SL to lock trail_lock_pct.
+       - SL only ratchets up; never lowered.
+       - Both Position.stop_loss AND Order.stop_loss are mutated so
+         check_exit on the same tick sees the new value.
+
+5. _evaluate_news(now, prices)
+       For each open position:
+         classifier reads recent headlines (lookback_min minutes).
+         On EXIT decision (halt / fraud / downgrade / regulator):
+             force_exit_position(ticker, current_price, "news_exit")
+
+6. for ticker, price in prices:
+       events = paper_trader.on_price_tick(ticker, price, now)
+       for event in events: _handle_event(event, now)
+                                                   ↓
+                          inserts/updates the positions table
+                          ("entry", "partial_exit", "exit")
+
+7. log "Poll at HH:MM:SS: N tickers, free_cash=X, open=K"
+8. return False              ← window still open
+```
+
+### 6.3 `paper_trader.on_price_tick`
+
+For each price tick:
+
+```
+1. Daily loss check
+   if daily_loss >= daily_loss_limit_pct × initial_capital:
+       trading_paused = True; bail.
+
+2. Hard exit time (15:15) → close any open position for that ticker.
+
+3. Pending orders for ticker
+   check_entry(price) →
+       if entry_zone_low ≤ price ≤ entry_zone_high:
+           fill order, create Position(entry_price=filled_price),
+           position_tracker.add_position(pos, capital_used)
+       (`add_position` deducts capital_used from free cash.)
+
+4. Open positions for ticker
+   check_exit(order_id, price) returns one of:
+     "sl"      → close_position("stop_loss")
+     "target1" →
+        if qty < 2: close_position("target_1")
+        else: partial_close_position(qty // 2, "target_1")
+              (book half; remainder rides for T2)
+     "target2" → close_position("target_2")
+
+5. Return [events]
+```
+
+### 6.4 Capital snapshot on every tick
+
+Right after `monitor.tick()` returns, the dispatcher calls
+`_snapshot_capital(...)` which does **two writes**:
+
+1. `daily_metrics` UPDATE (single rolled row per day):
+   - `free_cash`, `invested`, `pending_reserved`, `daily_pnl`.
+2. `capital_log` INSERT (append-only history):
+   - `at`, `start_capital`, `current_value`, `free_cash`, `invested`,
+     `pending_reserved`, `realized_pnl`, `unrealized_pnl`,
+     `open_positions_count`, `trigger`.
+
+Triggers in use today:
+
+| Trigger         | Emitted by                                        |
+| --------------- | ------------------------------------------------- |
+| `day_init`      | `handle_waiting` after `capital_service.init_day` |
+| `orders_placed` | `handle_waiting` after `run_execution_phase`      |
+| `monitor_tick`  | `handle_monitor` after each `monitor.tick()`      |
+| `hard_exit`     | `handle_monitor` when `tick()` returned True      |
+| `day_finalized` | `handle_analysis` after EOD reflection            |
+
+---
+
+## 7. Capital model
+
+File: `tradingagents/web/capital_service.py`
+
+```
+seed_capital      = DEFAULT_CONFIG["initial_capital"]   (constant lifetime)
+start_capital     = yesterday's EOD daily_metrics.capital
+                    (= seed_capital on day 1)
+free_cash         = cash available to place new orders
+                    = position_tracker.capital − pending_reserved
+invested          = Σ entry_price × qty   over open positions
+pending_reserved  = Σ entry_zone_high × qty   over PENDING orders
+realized_pnl      = position_tracker.daily_pnl  (cumulative for the day)
+unrealized_pnl    = Σ (current_price − entry_price) × qty  (open positions)
+
+current_value     = start_capital + realized_pnl              (live)
+mtm_value         = current_value + unrealized_pnl
+```
+
+Invariant (modulo rounding & charges):
+
+```
+free_cash + invested + pending_reserved == start_capital + realized_pnl
+```
+
+Lifecycle within a single trading day:
+
+| Time          | Event                | Capital effect                          |
+| ------------- | -------------------- | --------------------------------------- |
+| 09:30         | `init_day`           | `start_capital := free_cash := seed/prev EOD` |
+| 09:30         | order placed         | `pending_reserved += entry_high × qty`  |
+| 10:30–15:15   | fill                 | `pending_reserved -= …`; `invested += …`; `free_cash -= filled × qty` |
+| 10:30–15:15   | exit (full/partial)  | `invested -= …`; `free_cash += proceeds`; `realized_pnl += pnl` |
+| 15:15         | hard exit            | all opens closed                        |
+| 15:20         | `finalize_day`       | `capital := start_capital + realized_pnl`; `is_finalized := 1` |
+
+> Tomorrow morning, `get_latest_capital(before_date=today)` reads
+> yesterday's finalized `capital` — that's tomorrow's `start_capital`.
+> If yesterday wasn't finalized (crash, weekend), the most recent prior
+> finalized row is used; first-ever run falls back to `initial_capital`.
+
+---
+
+## 8. Database schema (what each table is for)
+
+| Table                     | Cardinality          | Role                                         |
+| ------------------------- | -------------------- | -------------------------------------------- |
+| `pipeline_state`          | 1 row                | Current state of the daily cycle.            |
+| `pipeline_state_history`  | 1 row per transition | Append-only audit of every state change.     |
+| `trade_plans`             | 1 row per ticker/day | The PM's plan — entry/SL/target/confidence.  |
+| `agent_reports`           | many per ticker/day  | Raw analyst markdown reports.                |
+| `debates`                 | 1 row per ticker/day | Bull/bear/judge transcript.                  |
+| `positions`               | 1 row per fill       | Open + closed positions (lifecycle here).    |
+| `daily_metrics`           | 1 row per day        | EOD stats + intraday capital buckets.        |
+| `capital_log`             | many per day         | Append-only intraday capital history.        |
+| `app_config`              | ~50 rows             | DB-backed runtime config (replaces dict).    |
+| `config_changes`          | append               | Audit trail of config PATCHes.               |
+| `token_usage`             | per stage            | LLM call accounting.                         |
+| `on_demand_analyses`      | per request          | UI-triggered ad-hoc analyses.                |
+
+Key `daily_metrics` columns added for the capital model:
+`start_capital`, `free_cash`, `invested`, `pending_reserved`, `is_finalized`.
+`insert_daily_metrics` is an UPSERT that only overwrites the stats columns
+so the capital buckets (set by `capital_service`) are preserved.
+
+---
+
+## 9. HTTP API surface (the contract the UI uses)
+
+Backend: `tradingagents/web/routes/*.py` → mounted under `/api`.
+
+### Dashboard / capital
+- `GET  /api/today?date=YYYY-MM-DD` — full day-view payload: pipeline state,
+  plans, positions, today's `portfolio` (live capital state), token stats.
+- `GET  /api/global-summary` — multi-day capital/return chart data.
+- `GET  /api/capital/log?date=&limit=` — intraday capital history (newest
+  first) for the on-screen log table.
+
+### Pipeline control
+- `GET  /api/pipeline/state` — state + state_since + last_heartbeat_at.
+- `POST /api/pipeline/transition` — manual override
+  (409 if a bg task is running).
+- `POST /api/pipeline/run-now/{stage}` — force a state immediately
+  (409 if a bg task is running).
+- `POST /api/pipeline/force-rerun` — cancel pending bg task, delete today's
+  trade rows, re-enter precheck. Hard-stops the deletion when a bg task is
+  already running.
+
+### Config
+- `GET   /api/config`, `PATCH /api/config/{key}`, `GET /api/config/history`
+  — runtime config CRUD against `app_config`.
+
+### Trades / positions / debates / files / etc.
+Standard CRUD over the matching tables (see `routes/`).
+
+---
+
+## 10. UI surfaces
+
+Frontend: `frontend/src/pages/Today.jsx` is the main control panel.
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│  Pipeline state badge   (state · since hh:mm · live hh:mm)         │
+│  Action buttons         (Run now, Force rerun, transition)         │
+├────────────────────────────────────────────────────────────────────┤
+│  Capital tiles                                                     │
+│    Invested Amount (seed) │ Current Value │ Free Cash │ Realized P&L│
+├────────────────────────────────────────────────────────────────────┤
+│  Trade plans for today   (entry zone, SL, T1/T2, confidence)       │
+├────────────────────────────────────────────────────────────────────┤
+│  Open positions          (live SL after trailing, P&L)             │
+├────────────────────────────────────────────────────────────────────┤
+│  Capital log             (per monitor check; new component)        │
+│    Time · Trigger · Current · Free Cash · Invested · Pending ·     │
+│    Realized · Unrealized · Open                                    │
+├────────────────────────────────────────────────────────────────────┤
+│  Live debate stream / token usage / day files                      │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+Polling intervals:
+- `/api/today` every **5s**.
+- `/api/capital/log` every **5s** (via `CapitalLogTable`).
+- `/api/tokens` every **10s**.
+- `/api/files` every **15s**.
+
+The capital log is **append-only**, newest first, limited to 200 rows by
+default (≈40 entries on a normal trading day, plus the `day_init` /
+`orders_placed` / `day_finalized` events).
+
+Settings page (`Settings.jsx` + `SettingsForm.jsx`) writes through
+`/api/config/{key}`; the monitor and dispatcher pick up changes on the
+next tick (no restart needed).
+
+---
+
+## 11. Configuration keys you'll actually touch
+
+| Key                              | Default  | Effect                                                |
+| -------------------------------- | -------- | ----------------------------------------------------- |
+| `initial_capital`                | 20000    | First-day seed. Ignored once `daily_metrics` exists.  |
+| `min_capital_to_trade`           | 5000     | Floor; below this the day is skipped.                 |
+| `use_upper_band_only`            | true     | Anchor zone shift + order on `entry_zone_high`.       |
+| `top_k_positions`                | 3        | How many stocks the allocator promotes to trades.     |
+| `deploy_pct_top_k`               | 70       | % of capital to deploy across the top-K.              |
+| `max_capital_per_stock_pct`      | 25       | Hard per-stock cap.                                   |
+| `max_loss_per_trade_pct`         | 1.5      | Sizes qty so a stop-out loses at most this %.         |
+| `precheck_time`                  | 08:10    | IST. Idle → precheck.                                 |
+| `execution_time`                 | 09:30    | IST. Waiting → monitor (order placement).             |
+| `execution_window_start`         | 10:30    | Monitor starts polling at this time.                  |
+| `execution_window_end`           | 15:15    | Monitor's window-closed threshold.                    |
+| `hard_exit_time`                 | 15:15    | Force-close everything.                               |
+| `dispatcher_monitor_interval_sec`| 600      | Throttle `monitor.tick()` to once per N seconds.      |
+| `breakeven_trigger_pct`          | 0.5      | Unrealized% that raises SL to entry.                  |
+| `trail_trigger_pct`              | 1.0      | Unrealized% that activates the trail.                 |
+| `trail_lock_pct`                 | 0.3      | % below current price the trail locks in.             |
+| `news_check_enabled`             | true     | Run the news force-exit classifier each poll.         |
+| `news_check_lookback_min`        | 60       | Lookback window for fresh headlines.                  |
+| `dry_run_e2e`                    | false    | Use scripted prices + skip market-hours gate.         |
+
+---
+
+## 12. Charges / cost model (for forward-looking realism)
+
+P&L today is paper-only. When live trading lands, the Zerodha-style
+intraday (MIS) charges that will be baked into `Position.pnl`:
+
+- Brokerage: 0.03% or ₹20, whichever is lower, per executed side.
+- STT (sell side intraday): 0.025% of sell turnover.
+- Exchange transaction charges: NSE 0.00297% per side.
+- GST: 18% of (brokerage + transaction).
+- SEBI: ₹10 per crore (negligible).
+- Stamp duty (buy side): 0.003% of buy turnover.
+
+These are subtracted at exit so `realized_pnl` is net-of-fees by the time
+it lands in `daily_metrics` / `capital_log`.
+
+---
+
+## 13. Failure / recovery scenarios
+
+| Scenario                                       | What protects us                                                                                                            |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| Process restart mid-day                        | `_restore_paper_trader_from_db` rebuilds positions + pending orders. `init_day` is idempotent and back-fills `start_capital`. |
+| `precheck` crashes after some plans saved      | Plans are in `trade_plans`; `waiting`'s cache-miss path reloads them.                                                       |
+| `force_rerun` while bg task running            | API returns 409. `_cancel_background()` won't delete data while a writer thread is alive.                                   |
+| Same state held all day (no events)            | `last_heartbeat_at` advances every tick; `state_since` doesn't — UI shows liveness without losing "in-state-since".         |
+| Yesterday wasn't finalized (crash/weekend)     | `get_latest_capital(before_date)` walks back to the most recent finalized row.                                              |
+| Partial exit double-bookkeeping                | `update_position_partial_exit` mutates the existing row (qty, SL, T1, T2) without flipping `status=closed`.                 |
+| Trailing stop race vs check_exit on same tick  | The risk ladder mutates both `Position.stop_loss` AND the parent `Order.stop_loss` so `check_exit` reads the raised value.  |
+| Over-allocation across multiple pending orders | `_pending_reserved_capital()` is subtracted from `available` in `place_trade_plan`, plus a "total commitments ≤ initial" check. |
+
+---
+
+## 14. File map (where to look when something breaks)
+
+```
+run_pipeline.py                     ← phases (screener / analysis / execution / report)
+tradingagents/
+  pipeline/
+    state_machine.py                ← StateRow, transition_to, read_state, heartbeat
+    dispatcher.py                   ← APScheduler job, state handlers, capital snapshots
+    market_monitor.py               ← tick(), trailing stops, news exits, hard exit
+    plan_extractor.py               ← parse PM markdown → plan dict
+    allocator.py                    ← rank_and_allocate top-K
+    news_monitor.py                 ← classifier-driven force-exit
+  execution/
+    paper_trader.py                 ← place_trade_plan, on_price_tick, get_capital_state
+    order_manager.py                ← Order, OrderStatus, check_entry, check_exit
+    position_tracker.py             ← Position, capital, partial_close
+    risk_manager.py                 ← apply_trailing_stops, RiskThresholds
+  web/
+    database.py                     ← schema, init_db, migrations, CRUD
+    capital_service.py              ← init_day, snapshot, log_snapshot, get_log, finalize_day
+    config_service.py               ← load_config / set_config against app_config
+    routes/
+      pipeline.py                   ← /api/pipeline/*
+      dashboard.py                  ← /api/today, /api/capital/log, /api/global-summary
+      config.py                     ← /api/config*
+      positions.py, trades.py, …
+  default_config.py                 ← seed values + metadata for app_config
+frontend/
+  src/
+    pages/Today.jsx                 ← live control panel
+    pages/Settings.jsx              ← config editor
+    components/
+      CapitalLogTable.jsx           ← new — per-check capital history
+      PositionTableLive.jsx
+      PipelineStateBadge.jsx
+      SettingsForm.jsx
 ```
 
 ---
 
-## Quick Start
+## 15. Day-in-the-life timeline (IST)
 
-```bash
-source .venv/bin/activate
-
-# Full pipeline (skip market-open check for testing)
-python run_pipeline.py --skip-market-check --top-n 1
-
-# Analysis only (no orders, no monitoring)
-python run_pipeline.py --skip-market-check --analyze-only --top-n 3
-
-# Web dashboard
-python run_web.py
-# → http://localhost:5000
-
-# Automated daily (leave running)
-python -m tradingagents.pipeline.daily_runner
 ```
+08:10  idle → precheck       (screener + LLM analysis fan-out)
+08:50  precheck → waiting    (plans saved, allocator picked top-K)
+09:30  waiting fires:
+         - init_day(start_capital)
+         - capital_log: "day_init"
+         - place pending orders
+         - capital_log: "orders_placed"
+       waiting → monitor
+10:30  monitor begins polling (every 10 min)
+         every tick: trailing stops → news scan → fills/exits
+                     → capital_log: "monitor_tick"
+13:42  partial_exit T1 → positions table updated → capital_log row
+14:55  trailing stop lifted SL to ₹X.XX (no exit)
+15:15  monitor.tick() sees window closed → hard_exit_all
+         capital_log: "hard_exit"
+       monitor → analysis
+15:16  analysis:
+         - run_reporting_phase (daily_metrics UPSERT)
+         - run_eod_reflection (per-trade post-mortem)
+         - capital_log: "day_finalized"
+         - capital_service.finalize_day (capital = start + realized)
+       analysis → idle
+       (next morning, start_capital = today's finalized capital)
+```
+
+---
+
+## 16. Dry-run E2E mode
+
+For testing the whole flow without waiting for the market or burning LLM
+tokens. Gated by the existing `dry_run_e2e` flag in `app_config`
+(seeded from `default_config.py`). No new flags were added.
+
+### 16.1 What dry-run mode changes
+
+| Surface                              | Normal mode                                      | Dry-run mode                                                       |
+| ------------------------------------ | ------------------------------------------------ | ------------------------------------------------------------------ |
+| `is_market_closed` gate (dispatcher) | Forces `STATE_HOLIDAY` on weekends/holidays.     | **Skipped.** Cycle runs any day.                                   |
+| `precheck_time` (08:10) gate         | `idle → precheck` blocked until 08:10 IST.       | **Skipped.** `idle → precheck` on the next tick.                   |
+| `has_completed_today("precheck")`    | Prevents re-entering precheck same day.          | **Skipped.** Re-runnable on demand.                                |
+| Screener                             | NSE universe → top-K.                            | **Skipped.** `dry_run_ticker` is the chosen stock.                 |
+| Multi-agent analysis + debate        | Full LangGraph fan-out, ~$N tokens.              | **Skipped entirely.** Mock plan built from `dry_run_plan`.         |
+| `execution_time` (09:30) gate        | `waiting → monitor` blocked until 09:30 IST.     | **Skipped.** Orders placed on the next tick.                       |
+| Live price fetch in execution        | `yfinance` 1m bar.                               | **Skipped.** Levels come from `dry_run_plan` config.               |
+| `execution_window_start` (10:30) gate| Monitor doesn't poll before 10:30.               | **Skipped.**                                                       |
+| Monitor poll throttle                | `dispatcher_monitor_interval_sec` (default 600s).| **Skipped.** Monitor runs every dispatcher tick.                   |
+| Monitor price source                 | yfinance fast_info.                              | Scripted `dry_run_price_sequence`, cycles when exhausted.          |
+| Window-closed gate inside `tick()`   | `is_execution_window` checked.                   | **Skipped.** (Already the existing behaviour for dry-run.)         |
+| News monitor (LLM classifier)        | Polls headlines each tick.                       | **Disabled** so dry-run is fully offline.                          |
+| Monitor → analysis transition        | Driven by hard-exit time + zero open work.       | One dispatcher tick burns the full price sequence, cancels unfilled pending orders, and force-exits leftover positions. Always returns `STATE_ANALYSIS`. |
+| `STATE_HOLIDAY`                      | Stays until next trading day.                    | **Auto-flips back to idle** so the cycle can loop.                 |
+
+### 16.2 One-tick-per-state cadence
+
+With dry-run enabled, the 60s dispatcher tick advances the state machine
+deterministically:
+
+```
+Tick 1   idle      → precheck    (precheck spawned in bg; ~ms)
+Tick 2   precheck  → waiting     (mock plan persisted to trade_plans)
+Tick 3   waiting   → monitor     (init_day, orders_placed, position_log)
+Tick 4   monitor:
+           - burns entire dry_run_price_sequence in one tick
+           - cancels unfilled pending orders
+           - force-exits leftover positions
+           → analysis
+Tick 5   analysis  → idle        (finalize_day; capital becomes EOD)
+```
+
+Total: **~5 ticks ≈ 5 minutes** for a full cycle, with no LLM calls and
+no external API calls. The `capital_log` accumulates the usual triggers
+plus one new dry-run-only trigger: `dry_run_force_exit`.
+
+### 16.3 What's still real
+
+Dry-run keeps the parts that *should* be exercised:
+
+- `PaperTrader.place_trade_plan` (all capital + math guards run).
+- `OrderManager.check_entry` / `check_exit` against the scripted prices.
+- The trailing-stop ladder in `RiskManager`.
+- `MarketMonitor._handle_event` writing to `positions` (`is_dry_run=1`).
+- `capital_service.init_day / snapshot / log_snapshot / finalize_day`.
+- `daily_metrics` UPSERT and `pipeline_state_history` audit rows.
+- Every dashboard/capital-log endpoint and UI render path.
+
+### 16.4 Knobs (all already in `app_config`)
+
+| Key                       | What it controls                                                 |
+| ------------------------- | ---------------------------------------------------------------- |
+| `dry_run_e2e`             | The master toggle. Flip to `true` to enter dry-run mode.         |
+| `dry_run_ticker`          | The single ticker the synthetic plan is built for.               |
+| `dry_run_plan`            | `entry_zone_low/high`, `stop_loss`, `target_1/2`, `confidence_score`, `position_size_pct`. Levels that the monitor's scripted prices interact with. |
+| `dry_run_price_sequence`  | Ordered list of prices fed to `MarketMonitor` each internal tick. Cycles when exhausted. |
+
+### 16.5 Running it
+
+1. Toggle `dry_run_e2e` to `true` (UI Settings page → Testing section, or
+   `PATCH /api/config/dry_run_e2e`).
+2. Wait for the next dispatcher tick (≤ 60s) or hit
+   `POST /api/pipeline/run-now/precheck` to start immediately.
+3. Watch the Capital log panel: you'll see `day_init`, `orders_placed`,
+   a burst of `monitor_tick` rows, possibly a `dry_run_force_exit`, then
+   `day_finalized`.
+4. Flip `dry_run_e2e` back to `false` before market open to resume
+   normal operation.
+
+### 16.6 What dry-run intentionally does NOT exercise
+
+- The LangGraph multi-agent debate (already covered by the live pipeline
+  and not what this mode is testing).
+- The screener / universe ranking.
+- yfinance / news / FII-DII data fetches.
+- The fast-classifier-driven news force-exit path.
+
+If you change any of those subsystems, run a live precheck against a
+single ticker — dry-run will silently bypass them.
+
+---
+
+## 17. How to verify the system in one minute
+
+1. Open `/api/pipeline/state` — `state` and `state_since` should match the
+   badge in the UI.
+2. Hit `/api/today` — `portfolio` should show non-zero `free_cash` once
+   `init_day` has run.
+3. Hit `/api/capital/log?date=YYYY-MM-DD` — you should see a `day_init`
+   row first thing in the morning, an `orders_placed` row right after
+   09:30, then `monitor_tick` rows every ~10 min.
+4. Open the UI's "Capital log" panel — it polls the same endpoint every
+   5s and renders the same rows colour-coded by realized/unrealized P&L.
+5. PATCH `dispatcher_monitor_interval_sec` to 60 via the Settings page →
+   within one minute the log starts adding a fresh row each tick.
+
+If any of those checks is off, jump to §13 first — the failure is almost
+always one of those cases.
