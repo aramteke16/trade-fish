@@ -60,6 +60,10 @@ _background_state: Optional[str] = None
 _background_started_at: Optional[float] = None
 _LONG_RUNNING_STATES = {STATE_PRECHECK, STATE_WAITING, STATE_ANALYSIS}
 
+# Wall-clock time of last monitor.tick() call — used for throttling instead of
+# state_since, which is reset every 60s tick and would prevent the poll from firing.
+_last_monitor_tick_at: Optional[float] = None
+
 
 def register_dispatcher(scheduler: BaseScheduler) -> None:
     """Install the fixed 60s dispatcher job. Idempotent."""
@@ -95,8 +99,10 @@ def _get_runtime(trade_date: str) -> dict[str, Any]:
 
 
 def _clear_runtime() -> None:
+    global _last_monitor_tick_at
     with _runtime_lock:
         _daily_runtime.clear()
+    _last_monitor_tick_at = None
 
 
 def get_active_paper_trader():
@@ -125,10 +131,11 @@ def _clear_background() -> None:
 
 def _cancel_background() -> None:
     """Cancel any in-flight background handler. Called by force-rerun API."""
-    global _background_future
+    global _background_future, _last_monitor_tick_at
     if _background_future is not None and not _background_future.done():
         _background_future.cancel()
     _clear_background()
+    _last_monitor_tick_at = None
 
 
 # ---------------------------------------------------------------------------
@@ -359,15 +366,12 @@ def handle_monitor(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
         logger.info("[monitor] hard exit time reached; transitioning to analysis")
         return STATE_ANALYSIS
 
-    # Throttle: only run tick() if enough time elapsed since last update
-    try:
-        last_update = datetime.fromisoformat(state_row.state_since)
-        if last_update.tzinfo is None:
-            last_update = last_update.replace(tzinfo=IST)
-        elapsed = (now - last_update).total_seconds()
-    except (ValueError, TypeError):
-        elapsed = monitor_interval  # force a tick on parse error
-
+    # Throttle using a wall-clock timestamp — NOT state_since.
+    # state_since is touched on every 60s tick to keep the UI badge fresh,
+    # which would reset elapsed to ~60s every tick and prevent the poll firing.
+    global _last_monitor_tick_at
+    now_ts = _time.time()
+    elapsed = (now_ts - _last_monitor_tick_at) if _last_monitor_tick_at is not None else monitor_interval
     if elapsed < monitor_interval:
         logger.debug("[monitor] throttled: %.0fs elapsed < %ds interval", elapsed, monitor_interval)
         return None
@@ -404,13 +408,12 @@ def handle_monitor(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
         runtime["monitor"] = monitor
 
     window_closed = monitor.tick(now)
+    _last_monitor_tick_at = _time.time()
     if window_closed:
         logger.info("[monitor] execution window closed; transitioning to analysis")
         return STATE_ANALYSIS
 
-    # Update state_since by re-transitioning to monitor
-    sm.transition_to(STATE_MONITOR, trade_date=state_row.trade_date)
-    return None  # already transitioned manually
+    return None
 
 
 def handle_analysis(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional[str]:
