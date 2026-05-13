@@ -43,8 +43,44 @@ from tradingagents.pipeline.state_machine import (
     STATE_WAITING,
 )
 from tradingagents.web.config_service import load_config
+from tradingagents.web import telegram_notifier as tg
 
 logger = logging.getLogger(__name__)
+
+
+def _tg(title: str, body: str = "", **fields) -> None:
+    """Best-effort Telegram notification. Guaranteed non-throwing — a busted
+    notifier must never crash the dispatcher."""
+    try:
+        tg.notify(title, body, **fields)
+    except Exception as e:  # noqa: BLE001 - we really want a catch-all here
+        logger.debug("[telegram] notify failed silently: %s", e)
+
+
+def _maybe_send_morning_brief(now: datetime, cfg: dict) -> None:
+    """Fire the daily morning brief exactly once per day.
+
+    Triggered from every dispatcher tick: if today >= configured time
+    AND we haven't sent today's brief yet (per the
+    ``telegram_morning_message_last_date`` flag in app_config), send it
+    and persist today's date so a reboot can't double-send.
+    """
+    if not cfg.get("telegram_notifications_enabled"):
+        return
+    if not cfg.get("telegram_morning_message_enabled", True):
+        return
+    if not sm.at_or_after(now, cfg.get("telegram_morning_message_time", "08:00")):
+        return
+    today = now.strftime("%Y-%m-%d")
+    if str(cfg.get("telegram_morning_message_last_date") or "") == today:
+        return
+    try:
+        sent = tg.notify_morning_brief(today)
+        if sent:
+            from tradingagents.web.config_service import set_config
+            set_config("telegram_morning_message_last_date", today)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("[telegram] morning brief send failed silently: %s", e)
 
 _SCHEDULER: Optional[BaseScheduler] = None
 _daily_runtime: dict[str, dict[str, Any]] = {}
@@ -186,6 +222,11 @@ def dispatch_pipeline() -> None:
         " [DRY RUN]" if dry_run else "",
     )
 
+    # Daily morning brief — fires from the first tick at or after the
+    # configured time each day. Persisted via app_config so a reboot
+    # later the same day can't double-send.
+    _maybe_send_morning_brief(now, cfg)
+
     # Market-closed check. In dry-run mode we deliberately skip this so the
     # E2E flow can be exercised on weekends/holidays/off-hours.
     if (
@@ -250,6 +291,12 @@ def dispatch_pipeline() -> None:
                 except Exception:
                     tb = traceback.format_exc()
                     logger.exception("[bg] handler %s crashed", state_row.state)
+                    _tg(
+                        f"Pipeline crash · {state_row.state}",
+                        body=tb.splitlines()[-1][:300] if tb else "no traceback",
+                        state=state_row.state,
+                        trade_date=state_row.trade_date,
+                    )
                     sm.transition_to(
                         STATE_IDLE,
                         trade_date=state_row.trade_date,
@@ -312,11 +359,10 @@ def dispatch_pipeline() -> None:
 
 def handle_idle(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional[str]:
     today = now.strftime("%Y-%m-%d")
-    # Dry-run E2E: bypass the wall-clock precheck gate but still respect
-    # the already-ran-today guard to prevent infinite cycling.
+    # Dry-run E2E: fully bypass the wall-clock precheck gate AND the
+    # already-ran-today guard so the cycle can be re-fired on demand for
+    # testing. The live pipeline still respects both.
     if cfg.get("dry_run_e2e"):
-        if sm.has_completed_today(today, "precheck"):
-            return None
         return STATE_PRECHECK
     if not sm.at_or_after(now, cfg.get("precheck_time", "08:10")):
         return None
@@ -367,11 +413,27 @@ def handle_precheck(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optiona
 
     dry_run = bool(cfg.get("dry_run_e2e", False))
 
+    _tg(
+        "Precheck started",
+        trade_date=trade_date,
+        mode="DRY RUN" if dry_run else "live",
+    )
+
     if dry_run:
-        from tradingagents.web.database import insert_trade_plan
+        from tradingagents.web.database import get_trade_plans, insert_trade_plan
         plan = _build_dry_run_plan(cfg, trade_date)
         try:
-            insert_trade_plan(plan)
+            existing = [
+                p for p in get_trade_plans(trade_date)
+                if p.get("ticker") == plan["ticker"] and p.get("rating") == "Buy"
+            ]
+            if existing:
+                logger.info(
+                    "[precheck] DRY RUN: plan already exists for %s today; skipping insert",
+                    plan["ticker"],
+                )
+            else:
+                insert_trade_plan(plan)
         except Exception as e:
             logger.warning("[precheck] DRY RUN: failed to persist mock plan: %s", e)
         runtime["plans"] = [plan]
@@ -379,6 +441,17 @@ def handle_precheck(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optiona
             "[precheck] DRY RUN: synthesized plan for %s — entry %.2f-%.2f SL %.2f T1 %.2f T2 %.2f",
             plan["ticker"], plan["entry_zone_low"], plan["entry_zone_high"],
             plan["stop_loss"], plan["target_1"], plan["target_2"],
+        )
+        _tg(
+            "Precheck complete",
+            body=f"1 synthetic plan ready (dry run)",
+            ticker=plan["ticker"],
+            rating=plan["rating"],
+            entry=f"{plan['entry_zone_low']}–{plan['entry_zone_high']}",
+            stop_loss=plan["stop_loss"],
+            target_1=plan["target_1"],
+            target_2=plan["target_2"],
+            confidence=f"{plan['confidence_score']}/10",
         )
         return STATE_WAITING
 
@@ -389,15 +462,30 @@ def handle_precheck(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optiona
     top_stocks = run_screener(top_n=top_n)
     if not top_stocks:
         logger.info("[precheck] no stocks passed screening; back to idle")
+        _tg("Precheck: no candidates", body="Screener returned 0 stocks — back to idle.")
         return STATE_IDLE
 
     plans = run_analysis_phase(top_stocks, date=trade_date)
     runtime["plans"] = plans
     if not plans:
         logger.info("[precheck] no actionable plans; back to idle")
+        _tg(
+            "Precheck: no actionable plans",
+            body=f"{len(top_stocks)} screened, 0 actionable — back to idle.",
+        )
         return STATE_IDLE
 
     logger.info("[precheck] %d actionable plans ready", len(plans))
+    plan_lines = "\n".join(
+        f"• <b>{p.get('ticker')}</b> {p.get('rating', '?')} "
+        f"conf {p.get('confidence_score', '?')}/10  "
+        f"entry {p.get('entry_zone_low')}–{p.get('entry_zone_high')} "
+        f"SL {p.get('stop_loss')} T1 {p.get('target_1')} T2 {p.get('target_2')}"
+        for p in plans
+    )
+    tg.notify_html(
+        f"<b>Precheck complete</b> · {len(plans)} actionable plan(s)\n{plan_lines}"
+    )
     return STATE_WAITING
 
 
@@ -438,12 +526,52 @@ def handle_waiting(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
     from tradingagents.web import capital_service
     capital_service.init_day(trade_date, starting_capital)
     _snapshot_capital(trade_date, paper_trader, trigger="day_init")
+    _tg(
+        "Day initialised",
+        trade_date=trade_date,
+        start_capital=tg.fmt_money(starting_capital),
+        plans_pending=len(plans),
+    )
 
     order_ids = run_execution_phase(plans, paper_trader)
     runtime["order_ids"] = order_ids
     _snapshot_capital(trade_date, paper_trader, trigger="orders_placed")
+
+    # Per-plan outcome notification. We map every plan to either a successful
+    # order (placed, with the actual qty/levels persisted by OrderManager) or
+    # a rejection (with the reason verbatim from paper_trader._reject).
+    placed_orders_by_ticker = {
+        o.ticker: o for o in paper_trader.order_manager.orders.values()
+    }
+    placed_lines, rejected_lines = [], []
+    for plan in plans:
+        t = plan.get("ticker")
+        if t in placed_orders_by_ticker:
+            o = placed_orders_by_ticker[t]
+            placed_lines.append(
+                f"• <b>{t}</b> qty {o.quantity} entry {o.entry_zone_low}–{o.entry_zone_high} "
+                f"SL {o.stop_loss} T1 {o.target_1} T2 {o.target_2}"
+            )
+        else:
+            reason = paper_trader.last_rejection_reason.get(t, "unknown")
+            rejected_lines.append(f"• <b>{t}</b> — {reason}")
+
+    if placed_lines or rejected_lines:
+        chunks = [f"<b>Order placement</b> · {trade_date}"]
+        if placed_lines:
+            chunks.append(f"\n<b>Placed ({len(placed_lines)}):</b>\n"
+                          + "\n".join(placed_lines))
+        if rejected_lines:
+            chunks.append(f"\n<b>Rejected ({len(rejected_lines)}):</b>\n"
+                          + "\n".join(rejected_lines))
+        tg.notify_html("\n".join(chunks))
+
     if not order_ids:
         logger.info("[waiting] no orders placed; skipping monitor")
+        _tg(
+            "No orders placed — skipping monitor",
+            body="All plans were rejected; going straight to analysis.",
+        )
         return STATE_ANALYSIS
 
     logger.info("[waiting] %d orders placed", len(order_ids))
@@ -656,6 +784,12 @@ def handle_monitor(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
         trigger="hard_exit" if window_closed else "monitor_tick",
         current_prices=getattr(monitor, "_last_prices", None) or None,
     )
+    _tg_monitor_snapshot(
+        trade_date,
+        paper_trader,
+        getattr(monitor, "_last_prices", None) or None,
+        hard_exit=window_closed,
+    )
     if window_closed:
         if paper_trader.position_tracker.open_positions:
             logger.warning(
@@ -666,6 +800,33 @@ def handle_monitor(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optional
         return STATE_ANALYSIS
 
     return None
+
+
+def _tg_monitor_snapshot(
+    trade_date: str,
+    paper_trader,
+    prices: Optional[dict],
+    *,
+    hard_exit: bool = False,
+) -> None:
+    """Format one monitor-tick state into a Telegram update."""
+    try:
+        state = paper_trader.get_capital_state(current_prices=prices)
+    except Exception as e:
+        logger.debug("[telegram] snapshot read failed: %s", e)
+        return
+    title = "Hard exit fired" if hard_exit else "Monitor tick"
+    _tg(
+        title,
+        trade_date=trade_date,
+        current_value=tg.fmt_money(state.get("current_value")),
+        free_cash=tg.fmt_money(state.get("free_cash")),
+        invested=tg.fmt_money(state.get("invested")),
+        pending=tg.fmt_money(state.get("pending_reserved")),
+        realized_pnl=tg.fmt_pnl(state.get("realized_pnl")),
+        unrealized_pnl=tg.fmt_pnl(state.get("unrealized_pnl")),
+        open_positions=state.get("open_positions_count"),
+    )
 
 
 def _run_dry_run_monitor(
@@ -703,6 +864,11 @@ def _run_dry_run_monitor(
         iterations,
         len(paper_trader.position_tracker.open_positions),
         len(paper_trader.order_manager.get_open_orders()),
+    )
+    _tg_monitor_snapshot(
+        trade_date,
+        paper_trader,
+        getattr(monitor, "_last_prices", None) or None,
     )
 
     # Cancel pending orders that never filled in the scripted sequence so
@@ -754,6 +920,39 @@ def handle_analysis(now: datetime, state_row: sm.StateRow, cfg: dict) -> Optiona
     _snapshot_capital(trade_date, paper_trader, trigger="day_finalized")
     from tradingagents.web import capital_service
     capital_service.finalize_day(trade_date)
+
+    # EOD report bundle: zip the day's reports/<DATE>/ tree (all agent
+    # markdown + debates + decisions) and upload to Telegram as a single
+    # archive. Gated by telegram_reports_enabled + telegram_reports_eod_zip.
+    try:
+        reports_dir = cfg.get("reports_dir", "")
+        if reports_dir:
+            tg.send_eod_reports_zip(trade_date, reports_dir)
+    except Exception as e:
+        logger.debug("[telegram] EOD zip send failed silently: %s", e)
+
+    # End-of-day Telegram summary: start vs end capital, realized P&L, trade
+    # count, win count. Pull the freshly-finalized row from daily_metrics so
+    # the numbers match what tomorrow's `start_capital` will be.
+    try:
+        row = capital_service.get_today(trade_date) or {}
+        metrics = paper_trader.get_state().get("metrics", {})
+        start_c = row.get("start_capital")
+        end_c = row.get("capital")
+        pnl = row.get("daily_pnl") or 0.0
+        ret_pct = (pnl / start_c * 100.0) if start_c else 0.0
+        _tg(
+            f"Day closed — {trade_date}",
+            start_capital=tg.fmt_money(start_c),
+            end_capital=tg.fmt_money(end_c),
+            daily_pnl=f"{tg.fmt_pnl(pnl)} ({ret_pct:+.2f}%)",
+            trades=metrics.get("total_trades"),
+            wins=metrics.get("winning_trades"),
+            win_rate=f"{metrics.get('win_rate', 0):.1f}%",
+            max_drawdown=f"{metrics.get('max_drawdown_pct', 0):.2f}%",
+        )
+    except Exception as e:
+        logger.debug("[telegram] EOD summary failed: %s", e)
 
     _clear_runtime()
     logger.info("[analysis] complete; back to idle")

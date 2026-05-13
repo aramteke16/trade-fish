@@ -131,6 +131,25 @@ DEFAULT_CONFIG = {
         1395.0, 1402.0, 1408.0, 1415.0,
         1422.0, 1435.0, 1441.0, 1450.0,
     ],
+    # Telegram side-channel for live pipeline events. Disabled by default —
+    # set the bot token + chat id and flip the toggle to start streaming
+    # precheck / order / monitor / exit / EOD updates to Telegram.
+    "telegram_notifications_enabled": False,
+    "telegram_bot_token": "",
+    "telegram_chat_id": "",
+    # Scheduled boot/morning notifications.
+    "telegram_startup_message_enabled": True,
+    "telegram_morning_message_enabled": True,
+    "telegram_morning_message_time": "08:00",
+    # Internal — auto-managed by the dispatcher so the morning brief
+    # doesn't double-fire after a reboot the same day. Do not edit by hand.
+    "telegram_morning_message_last_date": "",
+    # Report-file delivery to Telegram. Three independent toggles so you can
+    # send per-ticker reports as they're generated, a single end-of-day zip
+    # of everything, or both.
+    "telegram_reports_enabled": True,
+    "telegram_reports_per_ticker": True,
+    "telegram_reports_eod_zip": True,
 }
 
 
@@ -275,4 +294,16 @@ CONFIG_METADATA = {
     "dry_run_ticker":         {"category": "testing", "is_secret": False, "description": "Ticker to analyze in dry run (screener skipped)."},
     "dry_run_plan":           {"category": "testing", "is_secret": False, "description": "Hardcoded trade levels used at execution time in dry run (overrides agent output). JSON object."},
     "dry_run_price_sequence": {"category": "testing", "is_secret": False, "description": "Ordered price list fed to monitor ticks in dry run — cycles when exhausted. JSON array."},
+
+    # Telegram notifications
+    "telegram_notifications_enabled": {"category": "telegram", "is_secret": False, "description": "Stream live pipeline events (precheck, orders, monitor ticks, exits, EOD) to Telegram."},
+    "telegram_bot_token":              {"category": "telegram", "is_secret": True,  "description": "Bot token from @BotFather. Required when notifications are enabled."},
+    "telegram_chat_id":                {"category": "telegram", "is_secret": False, "description": "Telegram chat id to send updates to (your user id, group id, or channel id like -100…)."},
+    "telegram_startup_message_enabled":     {"category": "telegram", "is_secret": False, "description": "Post a 'Pipeline online' notification every time the FastAPI process boots."},
+    "telegram_morning_message_enabled":     {"category": "telegram", "is_secret": False, "description": "Post a daily morning brief (date, today's starting capital, prior-day P&L) at the configured time."},
+    "telegram_morning_message_time":        {"category": "telegram", "is_secret": False, "description": "IST time to send the morning brief (HH:MM). Fires from the first dispatcher tick at or after this time each day.", "input_type": "time"},
+    "telegram_morning_message_last_date":   {"category": "telegram", "is_secret": False, "description": "INTERNAL — last date the morning brief was sent. Auto-managed; do not edit."},
+    "telegram_reports_enabled":             {"category": "telegram", "is_secret": False, "description": "Master toggle for sending analysis report files (per-ticker .md + EOD .zip) to Telegram."},
+    "telegram_reports_per_ticker":          {"category": "telegram", "is_secret": False, "description": "Send each ticker's complete_report.md to Telegram as soon as it's generated during precheck."},
+    "telegram_reports_eod_zip":             {"category": "telegram", "is_secret": False, "description": "At EOD (in handle_analysis), zip the full reports/<DATE>/ tree and send as one attachment."},
 }

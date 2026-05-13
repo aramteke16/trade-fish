@@ -31,9 +31,32 @@ async def lifespan(app: FastAPI):
     app.state.scheduler = scheduler
     logger.info("FastAPI startup complete; cron dispatcher running")
 
+    # Best-effort Telegram boot notification. Gated by both
+    # telegram_notifications_enabled and telegram_startup_message_enabled
+    # and wrapped so a flaky bot can never block the FastAPI startup.
+    try:
+        from tradingagents.web.telegram_notifier import notify_startup
+        notify_startup()
+    except Exception as e:  # noqa: BLE001 - never let Telegram break boot
+        logger.warning("[telegram] startup notification failed silently: %s", e)
+
+    # Two-way Telegram command bot (/status, /today, /help). Polls only
+    # while telegram_notifications_enabled is true so flipping the toggle
+    # off pauses everything in ≤15s.
+    try:
+        from tradingagents.web import telegram_bot as _tb
+        _tb.start()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[telegram-bot] failed to start command poller: %s", e)
+
     try:
         yield
     finally:
+        try:
+            from tradingagents.web import telegram_bot as _tb
+            _tb.stop()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[telegram-bot] stop failed: %s", e)
         scheduler.shutdown(wait=False)
         logger.info("scheduler stopped")
 
@@ -51,7 +74,7 @@ def create_app() -> FastAPI:
 
     from .routes import (
         admin, analyze, config, dashboard, debates, files, history,
-        performance, pipeline, positions, stats, trades,
+        performance, pipeline, positions, stats, telegram, trades,
     )
 
     app.include_router(dashboard.router, prefix="/api")
@@ -66,6 +89,7 @@ def create_app() -> FastAPI:
     app.include_router(trades.router, prefix="/api")
     app.include_router(stats.router, prefix="/api")
     app.include_router(files.router, prefix="/api")
+    app.include_router(telegram.router, prefix="/api")
 
     @app.websocket("/ws/live")
     async def websocket_endpoint(websocket: WebSocket):

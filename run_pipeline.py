@@ -189,12 +189,20 @@ def _save_to_db(ticker: str, date: str, final_state: dict, plan: dict, rating: s
     # the user reviews pre-market the next day.
     try:
         from tradingagents.pipeline.report_writer import save_daily_analysis
-        save_daily_analysis(
+        ticker_dir = save_daily_analysis(
             final_state=final_state,
             ticker=ticker,
             date=date,
             reports_dir=_runtime_config().get("reports_dir"),
         )
+        # Push the freshly-written complete_report.md to Telegram so the
+        # full agent rationale lands in the channel as soon as it's ready
+        # (gated by telegram_reports_enabled + telegram_reports_per_ticker).
+        try:
+            from tradingagents.web import telegram_notifier as _tg
+            _tg.send_ticker_report(ticker, date, ticker_dir)
+        except Exception as e:
+            logger.debug("[telegram] per-ticker report send failed silently: %s", e)
     except Exception as e:
         logger.warning("Daily report save failed for %s: %s", ticker, e)
 

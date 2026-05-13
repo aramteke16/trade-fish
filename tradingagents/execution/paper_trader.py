@@ -33,6 +33,10 @@ class PaperTrader:
         self.position_tracker = PositionTracker(initial_capital)
         self.trading_paused = False
         self.pause_reason = ""
+        # Latest rejection reason per ticker — populated when place_trade_plan
+        # rejects an order. Lets the dispatcher / Telegram notifier explain
+        # *why* an order wasn't placed without screen-scraping logs.
+        self.last_rejection_reason: Dict[str, str] = {}
 
     def _pending_reserved_capital(self) -> float:
         """Sum of capital tied up by pending (unfilled) orders.
@@ -92,23 +96,36 @@ class PaperTrader:
             "open_positions_count": len(self.position_tracker.open_positions),
         }
 
-    def place_trade_plan(self, plan: dict) -> Optional[str]:
-        """Place a trade plan from the portfolio manager."""
-        if self.trading_paused:
-            logger.info("Trading paused: %s", self.pause_reason)
-            return None
+    def _reject(self, ticker: str, reason: str) -> None:
+        """Record why a plan was rejected, log it, and return None upstream."""
+        self.last_rejection_reason[ticker] = reason
+        logger.warning("[place_trade_plan] REJECT %s — %s", ticker, reason)
 
+    def place_trade_plan(self, plan: dict) -> Optional[str]:
+        """Place a trade plan from the portfolio manager.
+
+        Returns the order_id on success, or None on rejection. The reason
+        for any rejection is stored in ``self.last_rejection_reason[ticker]``
+        so the dispatcher / Telegram notifier can report it verbatim.
+        """
         ticker = plan["ticker"]
+
+        if self.trading_paused:
+            self._reject(ticker, f"trading paused — {self.pause_reason or 'unknown'}")
+            return None
 
         # Prevent duplicate orders for the same ticker
         for o in self.order_manager.orders.values():
             if o.ticker == ticker and o.status in (OrderStatus.PENDING, OrderStatus.FILLED):
-                logger.warning("Order for %s already exists (status=%s); skipping duplicate", ticker, o.status.value)
+                self._reject(
+                    ticker,
+                    f"duplicate: order already exists (status={o.status.value})",
+                )
                 return None
 
         # Prevent ordering a ticker we already hold
         if ticker in self.position_tracker.open_positions:
-            logger.warning("Already have open position for %s; skipping", ticker)
+            self._reject(ticker, "already holding an open position for this ticker")
             return None
         entry_low = plan.get("entry_zone_low")
         entry_high = plan.get("entry_zone_high")
@@ -124,13 +141,13 @@ class PaperTrader:
 
         if upper_band_only:
             if not all([entry_high, stop_loss, target_1]):
-                logger.warning("Incomplete trade plan for %s, skipping (need entry_zone_high, stop_loss, target_1)", ticker)
+                self._reject(ticker, "incomplete plan (need entry_zone_high, stop_loss, target_1)")
                 return None
             if entry_low is None:
                 entry_low = entry_high
         else:
             if not all([entry_high, stop_loss, target_1]) or entry_low is None:
-                logger.warning("Incomplete trade plan for %s, skipping", ticker)
+                self._reject(ticker, "incomplete plan (need entry_zone_low/high, stop_loss, target_1)")
                 return None
 
         # Capital allocation — only the cash that's not already committed by
@@ -145,7 +162,10 @@ class PaperTrader:
         # Quantity based on max loss
         risk_per_share = entry_high - stop_loss
         if risk_per_share <= 0:
-            logger.warning("Invalid risk for %s: SL >= entry", ticker)
+            self._reject(
+                ticker,
+                f"invalid risk: SL ₹{stop_loss} >= entry ₹{entry_high}",
+            )
             return None
 
         max_loss_inr = available * (self.max_loss_per_trade_pct / 100)
@@ -157,16 +177,18 @@ class PaperTrader:
             capital_needed = qty * entry_high
 
         if qty <= 0:
-            logger.warning(
-                "Insufficient free cash for %s: available ₹%.2f (free_cash ₹%.2f, pending_reserved ₹%.2f)",
-                ticker, available, self.position_tracker.capital, pending_reserved,
+            self._reject(
+                ticker,
+                f"insufficient free cash — available ₹{available:.2f} "
+                f"(free_cash ₹{self.position_tracker.capital:.2f}, "
+                f"pending_reserved ₹{pending_reserved:.2f})",
             )
             return None
 
         if capital_needed > available:
-            logger.warning(
-                "Order for %s would exceed free cash: needed ₹%.2f > available ₹%.2f. Skipping.",
-                ticker, capital_needed, available,
+            self._reject(
+                ticker,
+                f"capital_needed ₹{capital_needed:.2f} > available ₹{available:.2f}",
             )
             return None
 
@@ -179,11 +201,11 @@ class PaperTrader:
         )
         total_committed = pending_reserved + invested + capital_needed
         if total_committed > self.position_tracker.initial_capital:
-            logger.warning(
-                "Order for %s would breach total capital ceiling: "
-                "pending ₹%.0f + invested ₹%.0f + this ₹%.0f = ₹%.0f > initial ₹%.0f. Skipping.",
-                ticker, pending_reserved, invested, capital_needed,
-                total_committed, self.position_tracker.initial_capital,
+            self._reject(
+                ticker,
+                f"would breach capital ceiling: pending ₹{pending_reserved:.0f} "
+                f"+ invested ₹{invested:.0f} + this ₹{capital_needed:.0f} "
+                f"= ₹{total_committed:.0f} > initial ₹{self.position_tracker.initial_capital:.0f}",
             )
             return None
 

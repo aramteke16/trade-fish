@@ -339,12 +339,15 @@ class MarketMonitor:
             logger.warning("Could not fetch prices for hard exit. Positions remain open.")
 
     def _handle_event(self, event: dict, now: datetime):
-        """Log trade events and persist to database."""
+        """Log trade events, persist to database, and ping Telegram."""
+        from tradingagents.web import telegram_notifier as _tg
+
         event_type = event.get("type", "unknown")
         ticker = event.get("ticker", "?")
         price = event.get("price")
         reason = event.get("reason", "")
         pnl = event.get("pnl")
+        pnl_pct = event.get("pnl_pct")
 
         if event_type == "entry":
             logger.info("ENTRY: %s @ %.2f qty=%s", ticker, price, event.get("qty"))
@@ -360,6 +363,18 @@ class MarketMonitor:
                 "opened_at": now.isoformat(),
                 "is_dry_run": self._is_dry_run,
             })
+            try:
+                _tg.notify(
+                    "ENTRY",
+                    ticker=ticker,
+                    qty=event.get("qty"),
+                    entry_price=_tg.fmt_money(price),
+                    stop_loss=_tg.fmt_money(event.get("stop_loss")),
+                    target_1=_tg.fmt_money(event.get("target_1")),
+                    target_2=_tg.fmt_money(event.get("target_2")),
+                )
+            except Exception as e:
+                logger.debug("[telegram] entry notify failed: %s", e)
         elif event_type == "partial_exit":
             pnl_str = f" P&L=Rs.{pnl:.2f}" if pnl is not None else ""
             logger.info("PARTIAL EXIT: %s @ %.2f reason=%s%s", ticker, price, reason, pnl_str)
@@ -371,6 +386,20 @@ class MarketMonitor:
                     "target_1": remaining.target_1,
                     "target_2": remaining.target_2,
                 })
+            try:
+                _tg.notify(
+                    "PARTIAL EXIT",
+                    ticker=ticker,
+                    exit_price=_tg.fmt_money(price),
+                    qty=event.get("qty"),
+                    reason=reason,
+                    pnl=_tg.fmt_pnl(pnl),
+                    pnl_pct=f"{pnl_pct:+.2f}%" if pnl_pct is not None else "—",
+                    remaining_qty=(remaining.quantity if remaining else 0),
+                    new_stop_loss=(_tg.fmt_money(remaining.stop_loss) if remaining else "—"),
+                )
+            except Exception as e:
+                logger.debug("[telegram] partial_exit notify failed: %s", e)
         elif event_type == "exit":
             pnl_str = f" P&L=Rs.{pnl:.2f}" if pnl is not None else ""
             logger.info("EXIT: %s @ %.2f reason=%s%s", ticker, price, reason, pnl_str)
@@ -378,6 +407,17 @@ class MarketMonitor:
                 "exit_price": price,
                 "exit_reason": reason,
                 "pnl": pnl,
-                "pnl_pct": event.get("pnl_pct"),
+                "pnl_pct": pnl_pct,
                 "closed_at": now.isoformat(),
             })
+            try:
+                _tg.notify(
+                    "EXIT",
+                    ticker=ticker,
+                    exit_price=_tg.fmt_money(price),
+                    reason=reason,
+                    pnl=_tg.fmt_pnl(pnl),
+                    pnl_pct=f"{pnl_pct:+.2f}%" if pnl_pct is not None else "—",
+                )
+            except Exception as e:
+                logger.debug("[telegram] exit notify failed: %s", e)

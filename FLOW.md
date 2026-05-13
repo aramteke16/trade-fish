@@ -788,7 +788,216 @@ single ticker — dry-run will silently bypass them.
 
 ---
 
-## 17. How to verify the system in one minute
+## 17. Telegram side-channel (live event stream)
+
+A small fire-and-forget Telegram notifier streams every meaningful pipeline
+event to a chat of your choice. This is the recommended way to follow what
+the system is doing day-to-day — the dashboard UI exists, but Telegram is
+push, mobile-friendly, and outlives any frontend bug.
+
+### 17.1 What gets sent
+
+| Event                              | Fired by                                  | Body content                                                                                                           |
+| ---------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Precheck started                   | `handle_precheck` top                     | `trade_date`, `mode` (live / DRY RUN).                                                                                 |
+| Precheck complete                  | `handle_precheck` end                     | One line per actionable plan: ticker, rating, conf/10, entry zone, SL, T1, T2.                                         |
+| Precheck: no actionable plans      | `handle_precheck` early-return            | Plain note, back to idle.                                                                                              |
+| Day initialised                    | `handle_waiting` after `init_day`         | `trade_date`, `start_capital`, `plans_pending`.                                                                        |
+| Order placement                    | `handle_waiting` after `run_execution_phase` | "Placed (N)" block with qty/levels per ticker + "Rejected (M)" block with the verbatim reason from `place_trade_plan`. |
+| No orders placed — skipping monitor| `handle_waiting` if 0 fills              | Plain note.                                                                                                            |
+| ENTRY                              | `MarketMonitor._handle_event(type=entry)` | ticker, qty, entry_price, SL, T1, T2.                                                                                  |
+| PARTIAL EXIT                       | `MarketMonitor._handle_event(type=partial_exit)` | ticker, exit_price, qty, reason, pnl, pnl%, remaining qty, new SL.                                                |
+| EXIT                               | `MarketMonitor._handle_event(type=exit)`  | ticker, exit_price, reason, pnl, pnl%.                                                                                 |
+| Monitor tick                       | `handle_monitor` after each `monitor.tick()` | trade_date, current_value, free_cash, invested, pending, realized P&L, unrealized P&L, open positions count.        |
+| Hard exit fired                    | `handle_monitor` when window closes       | Same as Monitor tick, with title flipped.                                                                              |
+| Day closed                         | `handle_analysis` after `finalize_day`    | start_capital, end_capital, daily_pnl (₹ + %), trades, wins, win rate, max drawdown.                                  |
+| Pipeline crash                     | dispatcher bg-handler exception path      | state, trade_date, last line of traceback.                                                                             |
+
+### 17.2 Why-it-was-rejected reporting
+
+`PaperTrader.place_trade_plan` now stores a verbatim reason on every
+rejection in `paper_trader.last_rejection_reason[ticker]`. The dispatcher
+reads that map after `run_execution_phase` and surfaces each rejection in
+the Telegram order-placement message, so questions like "why was X not
+ordered?" are answerable from your phone:
+
+- `trading paused — daily loss limit hit`
+- `duplicate: order already exists (status=pending)`
+- `already holding an open position for this ticker`
+- `incomplete plan (need entry_zone_high, stop_loss, target_1)`
+- `invalid risk: SL ₹X >= entry ₹Y`
+- `insufficient free cash — available ₹A (free_cash ₹B, pending_reserved ₹C)`
+- `capital_needed ₹X > available ₹Y`
+- `would breach capital ceiling: pending ₹A + invested ₹B + this ₹C = ₹D > initial ₹E`
+
+### 17.3 Wiring it up
+
+Three knobs in `app_config` (created automatically; edit via Settings page
+or `PATCH /api/config/<key>`):
+
+| Key                                 | Default | Notes                                                              |
+| ----------------------------------- | ------- | ------------------------------------------------------------------ |
+| `telegram_notifications_enabled`    | `false` | Master toggle. No HTTP calls happen when this is off.              |
+| `telegram_bot_token`                | `""`    | From @BotFather. Marked secret in the config API.                  |
+| `telegram_chat_id`                  | `""`    | Your user id, group id, or channel id (channels look like `-100…`).|
+
+Steps:
+
+1. Talk to [@BotFather](https://t.me/BotFather), `/newbot`, copy the token.
+2. Start a chat with your bot and send any message (Telegram won't deliver
+   *to* the bot until you've messaged it once).
+3. Get your chat id — easiest way is `curl
+   "https://api.telegram.org/bot<TOKEN>/getUpdates"` after sending a message
+   — the `chat.id` field in the response is what you want.
+4. PATCH the three config keys, then verify with the test endpoint:
+
+```bash
+curl -X POST http://localhost:8000/api/telegram/test | jq
+curl http://localhost:8000/api/telegram/status | jq
+```
+
+### 17.4 Failure model
+
+The whole notifier is wrapped in defensive try/except: a flapping Telegram
+endpoint, an expired token, or a bad chat id will produce a single
+`logger.warning` (rate-limited to once per minute for missing creds) but
+will never propagate into the dispatcher. The trading pipeline is
+guaranteed to keep running with or without Telegram.
+
+HTTP sends happen on a small `ThreadPoolExecutor(max_workers=2)` so the
+dispatcher's 60s tick is never blocked on Telegram latency.
+
+### 17.5 Scheduled lifecycle notifications
+
+In addition to the per-event stream, two scheduled notifications run
+without any caller having to fire them:
+
+#### Startup message — every reboot
+
+Fired from `app.py`'s FastAPI `lifespan` startup, just after the cron
+dispatcher is registered. Body:
+
+- host (server hostname)
+- python version
+- pipeline state (idle / monitor / …)
+- trade_date
+- start_capital (today)
+- current_value (today)
+- realized_pnl (today)
+
+Gated by `telegram_notifications_enabled` AND
+`telegram_startup_message_enabled` (default `true`), so you can silence
+reboot noise during a maintenance window without disabling the rest of
+the notifier.
+
+#### Morning brief — daily at the configured time
+
+Fired from the first dispatcher tick at or after
+`telegram_morning_message_time` (default `08:00` IST). Body:
+
+- starting_capital (today's expected start — yesterday's EOD if
+  finalized, otherwise live carry-forward)
+- previous_day_end_capital
+- previous_day_pnl
+- previous_day_finalized (yes / no — carrying live value)
+
+Idempotent across reboots: after a successful send the date is written
+to `telegram_morning_message_last_date` in `app_config`. If the server
+reboots later the same day, the next tick re-checks that flag and
+*won't* re-send the brief — but the **startup message** still fires, so
+you always know the process came back up.
+
+Config keys for both:
+
+| Key                                | Default | Notes                                                            |
+| ---------------------------------- | ------- | ---------------------------------------------------------------- |
+| `telegram_startup_message_enabled` | `true`  | Independent of the master toggle for noise control.              |
+| `telegram_morning_message_enabled` | `true`  | Same.                                                            |
+| `telegram_morning_message_time`    | `08:00` | IST. Fires from the first tick at or after this time each day.   |
+| `telegram_morning_message_last_date` | `""`  | **Internal**, auto-managed. Stores the date the brief last fired. Don't edit. |
+
+### 17.6 Report attachments
+
+The pipeline writes per-ticker markdown reports to
+`<reports_dir>/<DATE>/<TICKER>/complete_report.md` plus per-agent files
+under `1_analysts/`, `2_research/`, `3_trading/`, `4_risk/`,
+`5_portfolio/`. The Telegram notifier can push these to your channel
+in two complementary ways:
+
+| Mode             | Fires from                                          | What gets sent                                                                 | Config gate                                       |
+| ---------------- | --------------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------- |
+| Per-ticker live  | `run_pipeline._save_to_db` right after `save_daily_analysis` writes the report tree | `complete_report.md` for that ticker, captioned `Report · TICKER · DATE`     | `telegram_reports_per_ticker` (default `true`)    |
+| End-of-day zip   | `handle_analysis` after `finalize_day`              | A single `<reports_dir>/<DATE>.zip` containing the full `<DATE>/` tree.        | `telegram_reports_eod_zip` (default `true`)       |
+
+Both gated additionally by `telegram_reports_enabled` (default `true`)
+which is a master kill-switch, and of course by
+`telegram_notifications_enabled` itself.
+
+Telegram's bot upload limit is 50 MB; we cap at ~49 MB and skip with a
+warning if a single file/zip exceeds it. Daily zips have been measured
+at < 1 MB even with 5+ tickers analyzed, so this is comfortably under.
+
+Config keys:
+
+| Key                              | Default | Purpose                                                       |
+| -------------------------------- | ------- | ------------------------------------------------------------- |
+| `telegram_reports_enabled`       | `true`  | Master toggle for any report attachments.                     |
+| `telegram_reports_per_ticker`    | `true`  | Push each ticker's `complete_report.md` as soon as it's saved.|
+| `telegram_reports_eod_zip`       | `true`  | At EOD, zip the whole `<DATE>/` tree and upload as one file.  |
+
+The zip is also written to disk at `<reports_dir>/<DATE>.zip`, so even
+if Telegram is offline you'll have the archive locally.
+
+### 17.7 Two-way bot commands
+
+In addition to the one-way event stream, the FastAPI process runs a tiny
+long-polling worker (`tradingagents/web/telegram_bot.py`) that listens
+for `/command` messages from the same chat the notifier sends to. Commands
+implemented today:
+
+| Command   | What it returns                                                                                                              |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `/status` | Today: current value, start capital, free cash, invested, pending, realized P&L. Lifetime: seed, net P&L, days traded, total trades / wins / losses / win rate. |
+| `/today`  | Today's trade plans (rating + entry/SL/T1 per ticker), open positions, and any closed-today positions with exit reason + pnl. |
+| `/help`   | List of available commands.                                                                                                  |
+| `/start`  | Alias for `/help` (Telegram sends this on first contact).                                                                    |
+
+`/status` is the one the user asked for: current capital + invested
++ lifetime P&L all in one message.
+
+**Security model.** Only the chat id configured in
+`telegram_chat_id` is honoured. Commands from any other chat or DM are
+logged and silently dropped. There's no token or shared secret beyond
+the bot token itself.
+
+**Lifecycle.** The poller starts from `app.py`'s FastAPI lifespan (right
+after the startup notification) and stops when the lifespan exits. While
+`telegram_notifications_enabled` is `false`, the worker just sleeps in
+15-second chunks — flipping the toggle on resumes polling within 15s
+without a restart.
+
+**Setup gotcha for channels.** If you want to issue `/status` *inside* a
+channel (instead of a DM to the bot), open BotFather, navigate to your
+bot → **Bot Settings → Group Privacy → Disable**, and add the bot as an
+admin in the channel. With Group Privacy enabled (the default), Telegram
+only forwards commands explicitly addressed as `/status@yourbotname` —
+which still works but is annoying to type. The simpler path is to send
+`/status` as a DM to the bot itself; that always works.
+
+### 17.8 Cadence in practice
+
+- **Live mode**: one monitor-tick notification per
+  `dispatcher_monitor_interval_sec` (default 600s) → ≈6 notifications per
+  trading hour for the heartbeat, plus entry/exit/partial events as they
+  fire. Total typical day: 20–40 messages.
+- **Dry-run mode**: a burst of `Monitor tick` messages from the inner
+  loop in `_run_dry_run_monitor` (one final monitor snapshot, plus one
+  per entry/exit event) — ≈8 messages per cycle. Useful for confirming
+  the wiring before live trading.
+
+---
+
+## 18. How to verify the system in one minute
 
 1. Open `/api/pipeline/state` — `state` and `state_since` should match the
    badge in the UI.
