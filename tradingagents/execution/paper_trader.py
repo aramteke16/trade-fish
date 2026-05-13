@@ -305,6 +305,11 @@ class PaperTrader:
                             "type": "partial_exit", "ticker": ticker, "price": price,
                             "reason": "target_1", "qty": exit_qty,
                             "pnl": booked.pnl, "pnl_pct": booked.pnl_pct,
+                            "entry_price": booked.entry_price,
+                            "stop_loss": booked.stop_loss,
+                            "target_1": booked.target_1,
+                            "target_2": booked.target_2,
+                            "opened_at": booked.opened_at,
                         })
 
             elif exit_signal == "target2":

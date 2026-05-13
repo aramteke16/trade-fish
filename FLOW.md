@@ -474,6 +474,27 @@ Lifecycle within a single trading day:
 
 ---
 
+### 7.1 `positions` row model — one row per closed slice
+
+Every fill writes exactly one open row to `positions`. Each exit
+materialises the **closed slice** as its own row:
+
+| Lifecycle                          | Rows in `positions` for that ticker+date                                                 |
+| ---------------------------------- | ----------------------------------------------------------------------------------------- |
+| Entry only (still open)            | 1 open row (qty=N).                                                                       |
+| Entry → full SL/T2/hard exit       | 1 closed row (qty=N, reason=…).                                                           |
+| Entry → T1 partial → full exit     | 2 closed rows: (qty=N/2, reason=target_1) + (qty=N/2, reason=…). Sum of `pnl` == `daily_metrics.daily_pnl` for that ticker (modulo rounding). |
+
+`update_position_partial_exit` keeps the **remaining open row** alive
+with the reduced qty + raised SL while the new partial-slice row is
+inserted as closed. `update_position_exit` later flips that remaining
+row to closed when the runner exits.
+
+This means `SUM(pnl) FROM positions WHERE date=… AND status='closed'`
+always reconciles with `daily_metrics.daily_pnl` for that date.
+
+---
+
 ## 8. Database schema (what each table is for)
 
 | Table                     | Cardinality          | Role                                         |
@@ -955,12 +976,17 @@ long-polling worker (`tradingagents/web/telegram_bot.py`) that listens
 for `/command` messages from the same chat the notifier sends to. Commands
 implemented today:
 
-| Command   | What it returns                                                                                                              |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `/status` | Today: current value, start capital, free cash, invested, pending, realized P&L. Lifetime: seed, net P&L, days traded, total trades / wins / losses / win rate. |
-| `/today`  | Today's trade plans (rating + entry/SL/T1 per ticker), open positions, and any closed-today positions with exit reason + pnl. |
-| `/help`   | List of available commands.                                                                                                  |
-| `/start`  | Alias for `/help` (Telegram sends this on first contact).                                                                    |
+| Command            | What it returns                                                                                                              |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `/status [date]`   | That day: current value, start capital, free cash, invested, pending, realized P&L. Lifetime: seed, net P&L, days traded, total trades / wins / losses / win rate. |
+| `/today  [date]`   | Plans (rating + entry/SL/T1 per ticker), open positions, and closed positions with exit reason + pnl. Defaults to today.    |
+| `/trades [date]`   | Every closed trade for that day: ticker, qty, entry → exit, reason, P&L, %. Sums to a daily total. Includes partial-exit slices as their own rows. |
+| `/history [N]`     | Last N (default 14, max 60) days' P&L from `daily_metrics`, plus net total.                                                  |
+| `/help`            | List of available commands.                                                                                                  |
+| `/start`           | Alias for `/help` (Telegram sends this on first contact).                                                                    |
+
+`date` accepts three forms: `today`, `yesterday`, or `YYYY-MM-DD`.
+Missing → defaults to today.
 
 `/status` is the one the user asked for: current capital + invested
 + lifetime P&L all in one message.

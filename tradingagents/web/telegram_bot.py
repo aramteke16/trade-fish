@@ -45,17 +45,36 @@ def _today_ist() -> str:
     return datetime.now(IST).strftime("%Y-%m-%d")
 
 
+def _parse_date_arg(args: str) -> str:
+    """Resolve a /<cmd> [date] argument to a YYYY-MM-DD string.
+
+    Accepts an empty arg (today), 'today', 'yesterday', or an explicit
+    YYYY-MM-DD. Raises ValueError on garbage.
+    """
+    s = (args or "").strip()
+    if not s or s.lower() == "today":
+        return _today_ist()
+    if s.lower() == "yesterday":
+        from datetime import timedelta
+        return (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
+    datetime.strptime(s, "%Y-%m-%d")
+    return s
+
+
 def _cmd_help(chat_id: str, args: str) -> str:
     return (
         "<b>Trading pipeline · commands</b>\n"
-        "/status — current capital, invested, today's & lifetime P&L\n"
-        "/today  — today's trade plans and open positions\n"
-        "/help   — this message"
+        "/status [date] — capital state + lifetime P&amp;L (default: today)\n"
+        "/today  [date] — plans, open + closed positions for that date\n"
+        "/trades [date] — every closed trade for that date with entry/exit/P&amp;L\n"
+        "/history [N]   — last N days summary (default 14)\n"
+        "/help          — this message\n"
+        "\n"
+        "Date forms: <code>today</code> · <code>yesterday</code> · <code>YYYY-MM-DD</code>"
     )
 
 
 def _cmd_status(chat_id: str, args: str) -> str:
-    """The big one: today's live capital state + lifetime aggregates."""
     from tradingagents.pipeline.dispatcher import get_active_paper_trader
     from tradingagents.web.capital_service import get_today as cap_today
     from tradingagents.web.config_service import load_config
@@ -65,41 +84,38 @@ def _cmd_status(chat_id: str, args: str) -> str:
         get_positions,
     )
 
+    try:
+        date = _parse_date_arg(args)
+    except ValueError as e:
+        return f"Bad date arg: <code>{tg._esc(args)}</code>. Use YYYY-MM-DD, today, or yesterday."
+
     cfg = load_config()
     seed = float(cfg.get("initial_capital", 20000))
-    today = _today_ist()
+    is_today = date == _today_ist()
 
-    # Today (prefer live PaperTrader, fall back to DB snapshot, fall back to legacy)
-    pt = get_active_paper_trader()
+    pt = get_active_paper_trader() if is_today else None
     if pt is not None:
         s = pt.get_capital_state()
-        today_start = s["start_capital"]
-        today_current = s["current_value"]
-        today_free = s["free_cash"]
-        today_invested = s["invested"]
-        today_pending = s["pending_reserved"]
-        today_realized = s["realized_pnl"]
+        start_c, cur, free_c = s["start_capital"], s["current_value"], s["free_cash"]
+        invested, pending, realized = s["invested"], s["pending_reserved"], s["realized_pnl"]
         source = "live"
     else:
-        row = cap_today(today) or {}
+        row = cap_today(date) or {}
         if row.get("start_capital") is not None:
-            today_start = float(row["start_capital"])
-            today_current = float(row.get("capital") or today_start)
-            today_free = float(row.get("free_cash") or today_current)
-            today_invested = float(row.get("invested") or 0)
-            today_pending = float(row.get("pending_reserved") or 0)
-            today_realized = float(row.get("daily_pnl") or 0)
-            source = "snapshot"
+            start_c = float(row["start_capital"])
+            cur = float(row.get("capital") or start_c)
+            free_c = float(row.get("free_cash") or cur)
+            invested = float(row.get("invested") or 0)
+            pending = float(row.get("pending_reserved") or 0)
+            realized = float(row.get("daily_pnl") or 0)
+            source = "finalized" if row.get("is_finalized") else "snapshot"
         else:
-            today_start = get_latest_capital(default=seed, before_date=today)
-            today_current = today_start
-            today_free = today_start
-            today_invested = 0.0
-            today_pending = 0.0
-            today_realized = 0.0
-            source = "legacy"
+            start_c = get_latest_capital(default=seed, before_date=date)
+            cur = start_c
+            free_c = start_c
+            invested = pending = realized = 0.0
+            source = "no-data"
 
-    # Lifetime
     all_metrics = get_daily_metrics()
     lifetime_pnl = sum((m.get("daily_pnl") or 0) for m in all_metrics)
     days_traded = sum(1 for m in all_metrics if m.get("is_finalized"))
@@ -110,35 +126,38 @@ def _cmd_status(chat_id: str, args: str) -> str:
     win_rate = (wins / total_trades * 100.0) if total_trades else 0.0
 
     return (
-        f"<b>Status · {today}</b>\n"
-        f"<i>capital source: {source}</i>\n"
+        f"<b>Status · {date}</b>\n"
+        f"<i>source: {source}</i>\n"
         f"\n"
-        f"<b>Today</b>\n"
-        f"• Current value: {tg.fmt_money(today_current)}\n"
-        f"• Start capital: {tg.fmt_money(today_start)}\n"
-        f"• Free cash:     {tg.fmt_money(today_free)}\n"
-        f"• Invested:      {tg.fmt_money(today_invested)}\n"
-        f"• Pending:       {tg.fmt_money(today_pending)}\n"
-        f"• Realized P&amp;L: {tg.fmt_pnl(today_realized)}\n"
+        f"<b>Day</b>\n"
+        f"• Current value: {tg.fmt_money(cur)}\n"
+        f"• Start capital: {tg.fmt_money(start_c)}\n"
+        f"• Free cash:     {tg.fmt_money(free_c)}\n"
+        f"• Invested:      {tg.fmt_money(invested)}\n"
+        f"• Pending:       {tg.fmt_money(pending)}\n"
+        f"• Realized P&amp;L: {tg.fmt_pnl(realized)}\n"
         f"\n"
         f"<b>Lifetime</b>\n"
         f"• Seed capital:  {tg.fmt_money(seed)}\n"
         f"• Net P&amp;L:      {tg.fmt_pnl(lifetime_pnl)}\n"
         f"• Days traded:   {days_traded}\n"
-        f"• Trades:        {total_trades} ({wins} wins · {losses} losses · {win_rate:.1f}% win rate)"
+        f"• Trades:        {total_trades} ({wins}W · {losses}L · {win_rate:.1f}% win rate)"
     )
 
 
 def _cmd_today(chat_id: str, args: str) -> str:
-    """Today's plans + open positions in one message."""
     from tradingagents.web.database import get_positions, get_trade_plans
 
-    today = _today_ist()
-    plans = get_trade_plans(today)
-    open_pos = [p for p in get_positions(status="open") if p.get("date") == today]
-    closed_today = [p for p in get_positions(status="closed") if p.get("date") == today]
+    try:
+        date = _parse_date_arg(args)
+    except ValueError:
+        return f"Bad date arg: <code>{tg._esc(args)}</code>. Use YYYY-MM-DD, today, or yesterday."
 
-    lines = [f"<b>Today · {today}</b>", "", f"<b>Plans ({len(plans)})</b>"]
+    plans = get_trade_plans(date)
+    open_pos = [p for p in get_positions(status="open") if p.get("date") == date]
+    closed = [p for p in get_positions(status="closed") if p.get("date") == date]
+
+    lines = [f"<b>{date}</b>", "", f"<b>Plans ({len(plans)})</b>"]
     if not plans:
         lines.append("• none")
     else:
@@ -162,25 +181,93 @@ def _cmd_today(chat_id: str, args: str) -> str:
                 f"T1 {p.get('target_1')}"
             )
 
-    lines += ["", f"<b>Closed today ({len(closed_today)})</b>"]
-    if not closed_today:
+    lines += ["", f"<b>Closed ({len(closed)})</b>"]
+    if not closed:
         lines.append("• none")
     else:
-        for p in closed_today:
+        total = 0.0
+        for p in closed:
+            pnl = p.get("pnl") or 0
+            total += pnl
             lines.append(
-                f"• {p.get('ticker')} exit @ {p.get('exit_price')} "
-                f"({p.get('exit_reason')}) {tg.fmt_pnl(p.get('pnl'))}"
+                f"• {p.get('ticker')} qty {p.get('quantity')} entry "
+                f"{p.get('entry_price')} → exit {p.get('exit_price')} "
+                f"({p.get('exit_reason')}) {tg.fmt_pnl(pnl)}"
             )
+        lines.append(f"<b>Closed total: {tg.fmt_pnl(total)}</b>")
 
     return "\n".join(lines)
 
 
-# Registry. `/start` is what Telegram sends on first contact — alias to /help.
+def _cmd_trades(chat_id: str, args: str) -> str:
+    from tradingagents.web.database import get_positions
+
+    try:
+        date = _parse_date_arg(args)
+    except ValueError:
+        return f"Bad date arg: <code>{tg._esc(args)}</code>. Use YYYY-MM-DD, today, or yesterday."
+
+    closed = sorted(
+        [p for p in get_positions(status="closed") if p.get("date") == date],
+        key=lambda p: p.get("closed_at") or "",
+    )
+    if not closed:
+        return f"<b>Trades · {date}</b>\nNo closed trades."
+
+    lines = [f"<b>Trades · {date}</b>", ""]
+    total = 0.0
+    for i, p in enumerate(closed, 1):
+        pnl = p.get("pnl") or 0
+        total += pnl
+        when = (p.get("closed_at") or "")[11:19] or "—"
+        lines.append(
+            f"{i}. <b>{p.get('ticker')}</b> · {when}\n"
+            f"   qty {p.get('quantity')} · entry {p.get('entry_price')} → "
+            f"exit {p.get('exit_price')} · {p.get('exit_reason')}\n"
+            f"   P&amp;L {tg.fmt_pnl(pnl)} "
+            f"({(p.get('pnl_pct') or 0):+.2f}%)"
+        )
+    lines += ["", f"<b>Total: {tg.fmt_pnl(total)}</b>"]
+    return "\n".join(lines)
+
+
+def _cmd_history(chat_id: str, args: str) -> str:
+    from tradingagents.web.database import get_daily_metrics
+
+    n = 14
+    s = (args or "").strip()
+    if s:
+        try:
+            n = max(1, min(60, int(s)))
+        except ValueError:
+            return f"Bad N: <code>{tg._esc(args)}</code>. Use a positive integer."
+
+    metrics = get_daily_metrics()[:n]
+    if not metrics:
+        return "<b>History</b>\nNo finalized days yet."
+
+    lines = [f"<b>History · last {len(metrics)} day(s)</b>", ""]
+    total = 0.0
+    for m in metrics:
+        pnl = m.get("daily_pnl") or 0
+        total += pnl
+        flag = "" if m.get("is_finalized") else " (open)"
+        lines.append(
+            f"• {m.get('date')}: {tg.fmt_pnl(pnl)}  "
+            f"(end {tg.fmt_money(m.get('capital'))}, "
+            f"{m.get('total_trades') or 0} trades){flag}"
+        )
+    lines += ["", f"<b>Net: {tg.fmt_pnl(total)}</b>"]
+    return "\n".join(lines)
+
+
 HANDLERS: dict[str, Callable[[str, str], Optional[str]]] = {
     "/help": _cmd_help,
     "/start": _cmd_help,
     "/status": _cmd_status,
     "/today": _cmd_today,
+    "/trades": _cmd_trades,
+    "/history": _cmd_history,
 }
 
 

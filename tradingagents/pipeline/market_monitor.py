@@ -378,6 +378,24 @@ class MarketMonitor:
         elif event_type == "partial_exit":
             pnl_str = f" P&L=Rs.{pnl:.2f}" if pnl is not None else ""
             logger.info("PARTIAL EXIT: %s @ %.2f reason=%s%s", ticker, price, reason, pnl_str)
+            opened_at = event.get("opened_at")
+            insert_position({
+                "date": now.strftime("%Y-%m-%d"),
+                "ticker": ticker,
+                "entry_price": event.get("entry_price"),
+                "exit_price": price,
+                "quantity": event.get("qty"),
+                "stop_loss": event.get("stop_loss"),
+                "target_1": event.get("target_1"),
+                "target_2": event.get("target_2"),
+                "status": "closed",
+                "exit_reason": reason or "target_1",
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "opened_at": opened_at.isoformat() if opened_at else now.isoformat(),
+                "closed_at": now.isoformat(),
+                "is_dry_run": self._is_dry_run,
+            })
             remaining = self.paper_trader.position_tracker.open_positions.get(ticker)
             if remaining is not None:
                 update_position_partial_exit(ticker, now.strftime("%Y-%m-%d"), {
